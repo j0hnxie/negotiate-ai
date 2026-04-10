@@ -30,7 +30,7 @@ async function loadSettings() {
   });
 
   ids.openaiApiKey.value = data.openaiApiKey || "";
-  ids.openaiModel.value = data.openaiModel || "gpt-4.1-mini";
+  ids.openaiModel.value = data.openaiModel || "gpt-5.4-mini";
   ids.anthropicApiKey.value = data.anthropicApiKey || "";
   ids.anthropicModel.value = data.anthropicModel || "claude-sonnet-4-20250514";
   ids.previousEmails.value = data.contextLibrary?.previousEmails || "";
@@ -44,7 +44,7 @@ async function saveSettings() {
   await chrome.storage.local.set({
     provider,
     openaiApiKey: ids.openaiApiKey.value.trim(),
-    openaiModel: ids.openaiModel.value.trim() || "gpt-4.1-mini",
+    openaiModel: ids.openaiModel.value.trim() || "gpt-5.4-mini",
     anthropicApiKey: ids.anthropicApiKey.value.trim(),
     anthropicModel: ids.anthropicModel.value.trim() || "claude-sonnet-4-20250514",
     contextLibrary: {

@@ -1619,16 +1619,16 @@ function addRowsFromMeetBlocks(found) {
       continue;
     }
 
-    const speaker = normalizeCaptionSpeaker(block.querySelector(".ZTmjQb")?.textContent || "Unknown");
+    const speaker = findCaptionSpeaker(block);
     for (const line of block.querySelectorAll(".iTTPOb")) {
-      pushCaptionRow(found, speaker, line.textContent || "");
+      pushCaptionRow(found, findCaptionSpeaker(line, speaker), line.textContent || "");
     }
   }
 }
 
 function addRowsFromDataAttributes(found) {
   for (const row of document.querySelectorAll("[data-sender-name][data-message-text]")) {
-    pushCaptionRow(found, row.getAttribute("data-sender-name") || "Unknown", row.getAttribute("data-message-text") || "");
+    pushCaptionRow(found, findCaptionSpeaker(row), row.getAttribute("data-message-text") || "");
   }
 }
 
@@ -1642,7 +1642,7 @@ function addRowsFromAccessibilityRegions(found) {
       continue;
     }
 
-    for (const line of extractRowsFromTextBlock(region.innerText || "")) {
+    for (const line of extractRowsFromTextBlock(region.innerText || "", findCaptionSpeaker(region))) {
       pushCaptionRow(found, line.speaker, line.text);
     }
   }
@@ -1663,14 +1663,14 @@ function addRowsFromCaptionLikeSelectors(found) {
         continue;
       }
 
-      for (const line of extractRowsFromTextBlock(node.innerText || "")) {
+      for (const line of extractRowsFromTextBlock(node.innerText || "", findCaptionSpeaker(node))) {
         pushCaptionRow(found, line.speaker, line.text);
       }
     }
   }
 }
 
-function extractRowsFromTextBlock(rawText) {
+function extractRowsFromTextBlock(rawText, fallbackSpeaker = "") {
   const normalizedLines = String(rawText || "")
     .split("\n")
     .map((line) => line.replace(/\s+/g, " ").trim())
@@ -1678,8 +1678,18 @@ function extractRowsFromTextBlock(rawText) {
     .filter((line) => isLikelyCaptionText(line));
 
   const rows = [];
-  for (const line of normalizedLines) {
-    const parsed = parseCaptionLine(line);
+  for (let index = 0; index < normalizedLines.length; index += 1) {
+    const line = normalizedLines[index];
+    if (looksLikeSpeakerLine(line) && normalizedLines[index + 1] && !looksLikeSpeakerLine(normalizedLines[index + 1])) {
+      rows.push({
+        speaker: normalizeCaptionSpeaker(line),
+        text: normalizeCaptionText(normalizedLines[index + 1])
+      });
+      index += 1;
+      continue;
+    }
+
+    const parsed = parseCaptionLine(line, fallbackSpeaker);
     if (parsed) {
       rows.push(parsed);
     }
@@ -1688,7 +1698,7 @@ function extractRowsFromTextBlock(rawText) {
   return rows;
 }
 
-function parseCaptionLine(line) {
+function parseCaptionLine(line, fallbackSpeaker = "") {
   const colonMatch = line.match(/^([^:]{1,40}):\s+(.+)$/);
   if (colonMatch) {
     return {
@@ -1706,7 +1716,7 @@ function parseCaptionLine(line) {
   }
 
   return {
-    speaker: "Unknown",
+    speaker: normalizeCaptionSpeaker(fallbackSpeaker || "Unknown"),
     text: normalizeCaptionText(line)
   };
 }
@@ -1724,11 +1734,67 @@ function pushCaptionRow(found, speakerRaw, textRaw) {
 }
 
 function normalizeCaptionSpeaker(value) {
-  const cleaned = normalizeText(value || "Unknown", 36);
+  const cleaned = normalizeText(extractSpeakerLabel(value || "Unknown"), 36);
   if (!cleaned) {
     return "Unknown";
   }
   return cleaned;
+}
+
+function findCaptionSpeaker(node, fallbackSpeaker = "") {
+  if (!(node instanceof Element)) {
+    return normalizeCaptionSpeaker(fallbackSpeaker || "Unknown");
+  }
+
+  const directCandidates = [
+    node.getAttribute("data-sender-name"),
+    node.getAttribute("data-participant-name"),
+    node.getAttribute("aria-label"),
+    node.querySelector(".ZTmjQb")?.textContent,
+    node.querySelector("[data-sender-name]")?.getAttribute("data-sender-name"),
+    node.querySelector("[data-participant-name]")?.getAttribute("data-participant-name"),
+    node.querySelector('[aria-label*=" says" i]')?.getAttribute("aria-label"),
+    node.closest("[data-sender-name]")?.getAttribute("data-sender-name"),
+    node.closest("[data-participant-name]")?.getAttribute("data-participant-name"),
+    node.closest('[aria-label*=" says" i]')?.getAttribute("aria-label")
+  ];
+
+  for (const candidate of directCandidates) {
+    const speaker = normalizeCaptionSpeaker(candidate || "");
+    if (speaker !== "Unknown") {
+      return speaker;
+    }
+  }
+
+  return normalizeCaptionSpeaker(fallbackSpeaker || "Unknown");
+}
+
+function extractSpeakerLabel(rawValue) {
+  const text = String(rawValue || "").replace(/\s+/g, " ").trim();
+  if (!text) {
+    return "";
+  }
+
+  const saysMatch = text.match(/^(.{1,40}?)\s+(?:says|is speaking)\b/i);
+  if (saysMatch) {
+    return saysMatch[1];
+  }
+
+  return text;
+}
+
+function looksLikeSpeakerLine(line) {
+  const value = normalizeText(line, 40);
+  if (!value || value.length > 32) {
+    return false;
+  }
+
+  const lower = value.toLowerCase();
+  if (/\$|\b(remote|hybrid|salary|bonus|equity|offer|package|location|team|pto)\b/.test(lower)) {
+    return false;
+  }
+
+  return /^[A-Za-z][A-Za-z .'-]{1,30}$/.test(value);
 }
 
 function normalizeCaptionText(value) {

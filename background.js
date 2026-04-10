@@ -6,7 +6,7 @@ const UPDATE_MIN_INTERVAL_MS = 4500;
 const CAPTION_STALE_MS = 20000;
 const MAX_TRANSCRIPT_LINES = 700;
 const MAX_LINES_PER_PROMPT = 160;
-const DEFAULT_OPENAI_MODEL = "gpt-4.1-mini";
+const DEFAULT_OPENAI_MODEL = "gpt-5.4-mini";
 const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
 const GOAL_STOP_WORDS = new Set([
   "the",
@@ -192,6 +192,10 @@ async function handleStartSession(sender, message) {
     state.lastAdviceAt = 0;
     state.lastCaptionAt = 0;
     state.marketCache = {};
+    state.strategyTopic = "general";
+    state.marketTopic = "general";
+    state.lastStrategyTranscriptLength = 0;
+    state.lastMarketTranscriptLength = 0;
   } else {
     state.offerTerms = mergeOfferTerms(defaultOfferTerms(), state.offerTerms);
   }
@@ -257,12 +261,10 @@ async function handleTranscriptChunk(sender, message) {
   state.goals = reconcileGoalsWithTranscript(state.goals, state.transcript, state.offerTerms);
   state.statusText = "Listening live...";
   const detectedTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
-  const topicChanged = detectedTopic !== (state.currentTopic || "general");
   state.currentTopic = detectedTopic;
-  const activeGoal = pickActiveGoal(state.goals, state.currentTopic);
+  const refreshPlan = buildPanelRefreshPlan(state);
   state.panelData = {
     ...(state.panelData || makeInitialPanelData(state.goals)),
-    strategy: buildStrategyPanel(state, activeGoal, state.currentTopic),
     goals: state.goals.map((goal) => ({ ...goal })),
     offerTerms: { ...state.offerTerms },
     watchouts: buildWatchouts(state.transcript[state.transcript.length - 1] || null),
@@ -272,8 +274,8 @@ async function handleTranscriptChunk(sender, message) {
   sendStateToTab(tabId, state);
 
   const now = Date.now();
-  if (state.coachEnabled && !state.generating && (topicChanged || now - state.lastAdviceAt >= UPDATE_MIN_INTERVAL_MS)) {
-    await generateAdviceForTab(tabId);
+  if (state.coachEnabled && !state.generating && refreshPlan.shouldRefresh && (refreshPlan.topicChanged || now - state.lastAdviceAt >= UPDATE_MIN_INTERVAL_MS)) {
+    await generateAdviceForTab(tabId, refreshPlan);
   }
 }
 
@@ -321,12 +323,16 @@ async function handleResetSession(tabId) {
   return buildSnapshot(state);
 }
 
-async function generateAdviceForTab(tabId) {
+async function generateAdviceForTab(tabId, precomputedPlan = null) {
   const state = await getOrCreateTabState(tabId, "unknown");
   if (!state.sessionActive || !state.coachEnabled || !state.transcript.length || state.generating) {
     return;
   }
   if (!state.lastCaptionAt || Date.now() - state.lastCaptionAt > CAPTION_STALE_MS) {
+    return;
+  }
+  const refreshPlan = precomputedPlan || buildPanelRefreshPlan(state);
+  if (!refreshPlan.shouldRefresh) {
     return;
   }
 
@@ -344,15 +350,24 @@ async function generateAdviceForTab(tabId) {
   sendStateToTab(tabId, state);
 
   try {
-    const prompt = buildPrompt(state, settings.contextLibrary);
+    const promptState = { ...state, currentTopic: refreshPlan.strategyTopic };
+    const prompt = buildPrompt(promptState, settings.contextLibrary, refreshPlan.strategyTopic);
     const rawText = await callProvider(settings, prompt);
     const parsed = parseJsonFromModel(rawText);
-    const panelData = normalizePanelData(parsed, state, settings.contextLibrary);
+    const panelData = normalizePanelData(parsed, promptState, settings.contextLibrary, refreshPlan);
 
     state.goals = panelData.goals.map((goal) => ({ ...goal }));
     state.offerTerms = { ...panelData.offerTerms };
     state.panelData = panelData;
     state.currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
+    if (refreshPlan.strategyShouldRefresh) {
+      state.strategyTopic = refreshPlan.strategyTopic;
+      state.lastStrategyTranscriptLength = state.transcript.length;
+    }
+    if (refreshPlan.marketShouldRefresh) {
+      state.marketTopic = refreshPlan.marketTopic;
+      state.lastMarketTranscriptLength = state.transcript.length;
+    }
     state.lastAdviceAt = Date.now();
     state.statusText = `Updated ${new Date(state.lastAdviceAt).toLocaleTimeString([], {
       hour: "numeric",
@@ -362,11 +377,23 @@ async function generateAdviceForTab(tabId) {
     await persistTabState(tabId);
     sendStateToTab(tabId, state);
   } catch (error) {
-    const fallbackPanel = buildHeuristicPanelData(state, settings.contextLibrary);
+    const fallbackPanel = buildHeuristicPanelData(
+      { ...state, currentTopic: refreshPlan.strategyTopic },
+      settings.contextLibrary,
+      refreshPlan
+    );
     state.goals = fallbackPanel.goals.map((goal) => ({ ...goal }));
     state.offerTerms = { ...fallbackPanel.offerTerms };
     state.panelData = fallbackPanel;
     state.currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
+    if (refreshPlan.strategyShouldRefresh) {
+      state.strategyTopic = refreshPlan.strategyTopic;
+      state.lastStrategyTranscriptLength = state.transcript.length;
+    }
+    if (refreshPlan.marketShouldRefresh) {
+      state.marketTopic = refreshPlan.marketTopic;
+      state.lastMarketTranscriptLength = state.transcript.length;
+    }
     state.statusText = `Fallback mode: ${normalizeShortText(error.message, 100)}`;
     await persistTabState(tabId);
     sendStateToTab(tabId, state);
@@ -449,12 +476,13 @@ async function callAnthropic(settings, prompt) {
   return outputText;
 }
 
-function buildPrompt(state, libraryContext) {
+function buildPrompt(state, libraryContext, strategyTopicOverride = "") {
   const transcriptText = state.transcript
     .slice(-MAX_LINES_PER_PROMPT)
     .map((line) => `[${new Date(line.at).toLocaleTimeString()}] ${line.speaker}: ${line.text}`)
     .join("\n");
-  const currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
+  const currentTopic = normalizeShortText(strategyTopicOverride || state.currentTopic || "", 24) ||
+    detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
 
   const goalPayload = state.goals.map((goal) => ({
     id: goal.id,
@@ -532,9 +560,9 @@ function buildPrompt(state, libraryContext) {
   ].join("\n");
 }
 
-function normalizePanelData(raw, state, contextLibrary) {
+function normalizePanelData(raw, state, contextLibrary, refreshPlan = null) {
   const goalUpdates = Array.isArray(raw?.goals) ? raw.goals : [];
-  const mergedOfferTerms = mergeOfferTerms(state.offerTerms, raw?.offer_terms || raw?.offerTerms || {});
+  const mergedOfferTerms = mergeOfferTerms(state.offerTerms, {});
   const draftGoals = state.goals.map((goal, index) => {
     const update =
       goalUpdates.find((item) => String(item?.id || "") === goal.id) ||
@@ -550,7 +578,8 @@ function normalizePanelData(raw, state, contextLibrary) {
     };
   });
   const nextGoals = reconcileGoalsWithTranscript(draftGoals, state.transcript, mergedOfferTerms);
-  const currentTopic = detectCurrentTopic(state.transcript, nextGoals, mergedOfferTerms);
+  const currentTopic = normalizeShortText(refreshPlan?.strategyTopic || state.currentTopic || "", 24) ||
+    detectCurrentTopic(state.transcript, nextGoals, mergedOfferTerms);
   const activeGoal = pickActiveGoal(nextGoals, currentTopic);
   const strategyState = {
     ...state,
@@ -560,14 +589,21 @@ function normalizePanelData(raw, state, contextLibrary) {
   };
 
   return {
-    strategy: buildStrategyPanel(strategyState, activeGoal, currentTopic),
-    marketResearch: buildStableMarketResearch(
-      strategyState,
-      contextLibrary,
-      mergedOfferTerms,
-      raw?.market_research || raw?.marketResearch || {},
-      state.panelData?.marketResearch
-    ),
+    strategy:
+      refreshPlan?.strategyShouldRefresh === false
+        ? state.panelData?.strategy || makeInitialPanelData(nextGoals).strategy
+        : buildStrategyPanel(strategyState, activeGoal, currentTopic),
+    marketResearch:
+      refreshPlan?.marketShouldRefresh === false
+        ? state.panelData?.marketResearch || makeInitialPanelData(nextGoals).marketResearch
+        : buildStableMarketResearch(
+            { ...strategyState, currentTopic: refreshPlan?.marketTopic || currentTopic },
+            contextLibrary,
+            mergedOfferTerms,
+            raw?.market_research || raw?.marketResearch || {},
+            state.panelData?.marketResearch,
+            refreshPlan?.marketTopic || currentTopic
+          ),
     goals: nextGoals,
     offerTerms: mergedOfferTerms,
     watchouts: normalizeStringArray(raw?.watchouts, 2, 90),
@@ -829,6 +865,10 @@ async function persistTabState(tabId) {
       panelData: state.panelData,
       marketCache: state.marketCache,
       currentTopic: state.currentTopic,
+      strategyTopic: state.strategyTopic,
+      marketTopic: state.marketTopic,
+      lastStrategyTranscriptLength: state.lastStrategyTranscriptLength,
+      lastMarketTranscriptLength: state.lastMarketTranscriptLength,
       lastAdviceAt: state.lastAdviceAt,
       lastCaptionAt: state.lastCaptionAt,
       statusText: state.statusText
@@ -866,6 +906,10 @@ function hydrateTabState(raw, meetingId) {
     panelData: makeInitialPanelData(goals),
     marketCache: normalizeMarketCache(raw?.marketCache),
     currentTopic: normalizeShortText(raw?.currentTopic || "", 24) || "general",
+    strategyTopic: normalizeShortText(raw?.strategyTopic || "", 24) || "general",
+    marketTopic: normalizeShortText(raw?.marketTopic || "", 24) || "general",
+    lastStrategyTranscriptLength: Number(raw?.lastStrategyTranscriptLength || 0),
+    lastMarketTranscriptLength: Number(raw?.lastMarketTranscriptLength || 0),
     lastAdviceAt: Number(raw?.lastAdviceAt || 0),
     lastCaptionAt: Number(raw?.lastCaptionAt || 0),
     generating: false,
@@ -887,6 +931,10 @@ function resetStateForMeeting(state, meetingId, savedQuickContext = null) {
   state.panelData = makeInitialPanelData(state.goals);
   state.marketCache = {};
   state.currentTopic = "general";
+  state.strategyTopic = "general";
+  state.marketTopic = "general";
+  state.lastStrategyTranscriptLength = 0;
+  state.lastMarketTranscriptLength = 0;
   state.lastAdviceAt = 0;
   state.lastCaptionAt = 0;
   state.generating = false;
@@ -1159,10 +1207,11 @@ function parseJsonFromModel(text) {
   }
 }
 
-function buildHeuristicPanelData(state, contextLibrary) {
+function buildHeuristicPanelData(state, contextLibrary, refreshPlan = null) {
   const extractedTerms = extractOfferTermsFromTranscript(state.transcript, state.offerTerms);
   const nextGoals = reconcileGoalsWithTranscript(state.goals, state.transcript, extractedTerms);
-  const currentTopic = detectCurrentTopic(state.transcript, nextGoals, extractedTerms);
+  const currentTopic = normalizeShortText(refreshPlan?.strategyTopic || state.currentTopic || "", 24) ||
+    detectCurrentTopic(state.transcript, nextGoals, extractedTerms);
   const nextActiveGoal = pickActiveGoal(nextGoals, currentTopic);
   const strategyState = {
     ...state,
@@ -1172,8 +1221,21 @@ function buildHeuristicPanelData(state, contextLibrary) {
   };
 
   return {
-    strategy: buildStrategyPanel(strategyState, nextActiveGoal, currentTopic),
-    marketResearch: buildStableMarketResearch(strategyState, contextLibrary, extractedTerms, {}, state.panelData?.marketResearch),
+    strategy:
+      refreshPlan?.strategyShouldRefresh === false
+        ? state.panelData?.strategy || makeInitialPanelData(nextGoals).strategy
+        : buildStrategyPanel(strategyState, nextActiveGoal, currentTopic),
+    marketResearch:
+      refreshPlan?.marketShouldRefresh === false
+        ? state.panelData?.marketResearch || makeInitialPanelData(nextGoals).marketResearch
+        : buildStableMarketResearch(
+            { ...strategyState, currentTopic: refreshPlan?.marketTopic || currentTopic },
+            contextLibrary,
+            extractedTerms,
+            {},
+            state.panelData?.marketResearch,
+            refreshPlan?.marketTopic || currentTopic
+          ),
     goals: nextGoals,
     offerTerms: extractedTerms,
     watchouts: buildWatchouts(state.transcript[state.transcript.length - 1] || null),
@@ -1621,6 +1683,109 @@ function buildWatchouts(latestLine) {
   return warnings.slice(0, 2);
 }
 
+function buildPanelRefreshPlan(state) {
+  const detectedTopic = normalizeShortText(state.currentTopic || "", 24) ||
+    detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
+  const currentStrategyTopic = normalizeShortText(state.strategyTopic || "", 24) || detectedTopic || "general";
+  const currentMarketTopic = normalizeShortText(state.marketTopic || "", 24) || currentStrategyTopic;
+  const missingStrategy = !(state.panelData?.strategy?.bullets || []).length;
+  const missingMarket = !normalizeShortText(state.panelData?.marketResearch?.headline || "", 52) &&
+    !((state.panelData?.marketResearch?.bullets || []).length);
+  const topicChanged = shouldSwitchDisplayedTopic(state.transcript, currentStrategyTopic, detectedTopic);
+  const strategyTermChanged = didRelevantOfferTermChange(state.panelData?.offerTerms, state.offerTerms, currentStrategyTopic);
+  const marketTermChanged = didRelevantOfferTermChange(state.panelData?.offerTerms, state.offerTerms, currentMarketTopic);
+  const strategyProgressed = hasStrategyProgressSince(state, currentStrategyTopic);
+  const initialTopic = detectedTopic && detectedTopic !== "general" ? detectedTopic : currentStrategyTopic;
+
+  return {
+    shouldRefresh: missingStrategy || missingMarket || topicChanged || strategyTermChanged || marketTermChanged || strategyProgressed,
+    strategyShouldRefresh: missingStrategy || topicChanged || strategyTermChanged || strategyProgressed,
+    marketShouldRefresh: missingMarket || topicChanged || marketTermChanged,
+    topicChanged,
+    strategyTopic: topicChanged ? detectedTopic : (missingStrategy ? initialTopic : currentStrategyTopic),
+    marketTopic: topicChanged ? detectedTopic : (missingMarket ? initialTopic : currentMarketTopic)
+  };
+}
+
+function shouldSwitchDisplayedTopic(transcript, currentTopic, detectedTopic) {
+  if (!detectedTopic || detectedTopic === "general" || detectedTopic === currentTopic) {
+    return false;
+  }
+
+  const recentTopics = transcript
+    .slice(-6)
+    .map((line) => detectTopicFromText(line.text))
+    .filter((topic) => topic !== "general");
+
+  if (!recentTopics.length) {
+    return false;
+  }
+
+  return recentTopics.filter((topic) => topic === detectedTopic).length >= 2 && recentTopics.slice(-3).includes(detectedTopic);
+}
+
+function hasStrategyProgressSince(state, topic) {
+  const sinceIndex = Math.max(0, Number(state.lastStrategyTranscriptLength || 0));
+  const newLines = state.transcript.slice(sinceIndex);
+  if (newLines.length < 3) {
+    return false;
+  }
+
+  return hasTopicProgressSignal(newLines, topic);
+}
+
+function hasTopicProgressSignal(lines, topic) {
+  const text = lines.map((line) => String(line.text || "").toLowerCase()).join(" ");
+
+  if (topic === "baseSalary" || topic === "signingBonus" || topic === "equity") {
+    return /\$[\d,.]+|\b(band|range|approve|approval|cap|capped|final|offer|package|can do|could do|would be|will be|highest|flexibility)\b/.test(
+      text
+    );
+  }
+  if (topic === "location") {
+    return /\b(location|based|office|policy|remote|hybrid|onsite|on-site|sf|san francisco|new york|nyc|relocation)\b/.test(text);
+  }
+  if (topic === "team") {
+    return /\b(team|org|group|joining|distributed|infra|platform|core|would be|will be)\b/.test(text);
+  }
+  if (topic === "pto") {
+    return /\b(pto|vacation|time off|unlimited|days|weeks|policy)\b/.test(text);
+  }
+
+  return lines.length >= 6 && /\b(offer|package|approval|policy|team|location|salary|equity|bonus)\b/.test(text);
+}
+
+function didRelevantOfferTermChange(previousTerms, nextTerms, topic) {
+  const previous = previousTerms || {};
+  const next = nextTerms || {};
+  const field = getOfferFieldForTopic(topic);
+
+  if (field) {
+    const previousValue = normalizeShortText(previous[field] || "", 48);
+    const nextValue = normalizeShortText(next[field] || "", 48);
+    return nextValue && !isUnknownValue(nextValue) && previousValue !== nextValue;
+  }
+
+  return ["baseSalary", "signingBonus", "equity", "location", "pto", "team"].some((key) => {
+    const previousValue = normalizeShortText(previous[key] || "", 48);
+    const nextValue = normalizeShortText(next[key] || "", 48);
+    return nextValue && !isUnknownValue(nextValue) && previousValue !== nextValue;
+  });
+}
+
+function getOfferFieldForTopic(topic) {
+  const mapping = {
+    baseSalary: "baseSalary",
+    signingBonus: "signingBonus",
+    equity: "equity",
+    location: "location",
+    pto: "pto",
+    team: "team"
+  };
+
+  return mapping[topic] || "";
+}
+
 function reconcileGoalsWithTranscript(goals, transcript, offerTerms) {
   const currentTopic = detectCurrentTopic(transcript, goals, offerTerms);
   return goals.map((goal) => {
@@ -1841,9 +2006,10 @@ function isRecruiterAudience(state) {
   return /recruiter/i.test(state.quickContext.counterpartRole || "");
 }
 
-function buildStableMarketResearch(state, contextLibrary, offerTerms, rawMarketResearch, previousMarketResearch) {
+function buildStableMarketResearch(state, contextLibrary, offerTerms, rawMarketResearch, previousMarketResearch, topicOverride = "") {
   const anchors = extractContextAnchors(state, contextLibrary);
-  const topic = state.currentTopic || detectCurrentTopic(state.transcript, state.goals, offerTerms);
+  const topic = normalizeShortText(topicOverride || state.currentTopic || "", 24) ||
+    detectCurrentTopic(state.transcript, state.goals, offerTerms);
   const topicKey = normalizeShortText(topic || "general", 24) || "general";
   const cached = state.marketCache?.[topicKey] || {};
   const modelHeadline = normalizeShortText(rawMarketResearch?.headline || "", 52);
@@ -2015,54 +2181,307 @@ function buildOfferGapMarketBullet(topic, state, offerTerms, anchors) {
 
 function extractOfferTermsFromTranscript(transcript, currentTerms) {
   const next = { ...defaultOfferTerms(), ...(currentTerms || {}) };
-  const recent = transcript.slice(-40);
+  const buckets = {
+    baseSalary: new Map(),
+    signingBonus: new Map(),
+    equity: new Map(),
+    location: new Map(),
+    pto: new Map(),
+    team: new Map()
+  };
 
-  for (const line of recent) {
-    const text = line.text;
-    const lower = text.toLowerCase();
+  transcript.slice(-140).forEach((line, index) => {
+    const candidates = extractOfferTermCandidatesFromLine(line.text);
+    candidates.forEach((candidate) => {
+      addOfferCandidate(buckets[candidate.field], candidate.field, candidate.value, candidate.score, index);
+    });
+  });
 
-    const salaryMatch = text.match(/\$[\d,.]+\s?[kK]?/);
-    if (salaryMatch && /(salary|base|compensation|cash)/i.test(text)) {
-      next.baseSalary = salaryMatch[0].replace(/\s+/g, "");
-    }
-    if (salaryMatch && /(signing|sign-on|bonus)/i.test(text)) {
-      next.signingBonus = salaryMatch[0].replace(/\s+/g, "");
-    }
-    if (/(rsu|stock|equity|shares)/i.test(text)) {
-      const equityMatch = text.match(/\$[\d,.]+\s?[kK]?|\d[\d,.]*\s?(rsus|shares)/i);
-      if (equityMatch) {
-        next.equity = normalizeShortText(equityMatch[0], 24);
-      }
-    }
-    if (/(location|remote|hybrid|onsite|on-site|office|relocation)/i.test(lower)) {
-      const locationValue = ["remote", "hybrid", "onsite", "on-site"].find((item) => lower.includes(item));
-      if (locationValue) {
-        next.location = locationValue === "on-site" ? "On-site" : locationValue[0].toUpperCase() + locationValue.slice(1);
-      } else {
-        const locationPhrase =
-          text.match(/\b(?:in|at)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b/) ||
-          text.match(/\b(?:new york|nyc|san francisco|bay area|seattle|austin|boston|chicago|los angeles)\b/i);
-        if (locationPhrase) {
-          next.location = normalizeShortText(locationPhrase[1] || locationPhrase[0], 24);
-        }
-      }
-    }
-    if (/(pto|vacation|days off)/i.test(lower)) {
-      const ptoMatch = text.match(/\d+\s?(days|day|weeks|week)/i);
-      if (ptoMatch) {
-        next.pto = normalizeShortText(ptoMatch[0], 18);
-      }
-    }
-    if (/(team|org|organization|group|manager|reporting line)/i.test(lower)) {
-      const teamMatch =
-        text.match(/(?:join|joining|on|with|within|for)\s+(?:the\s+)?([A-Za-z][A-Za-z/& -]{2,40})\s+team/i) ||
-        text.match(/team\s+(?:is|would be|will be)\s+([A-Za-z][A-Za-z/& -]{2,40})/i) ||
-        text.match(/(?:manager|reporting line)\s+(?:would be|is)\s+([A-Za-z][A-Za-z/& -]{2,40})/i);
-      if (teamMatch) {
-        next.team = normalizeShortText(teamMatch[1], 28);
-      }
+  for (const field of Object.keys(buckets)) {
+    const confirmed = pickConfirmedOfferCandidate(field, buckets[field], next[field]);
+    if (confirmed) {
+      next[field] = confirmed;
     }
   }
 
   return next;
+}
+
+function extractOfferTermCandidatesFromLine(text) {
+  const original = normalizeShortText(text || "", 220);
+  const lower = original.toLowerCase();
+  if (!original || isQuestionLikeLine(lower)) {
+    return [];
+  }
+
+  const confidence = getOfferLineConfidence(lower);
+  const candidates = [];
+
+  collectAmountCandidates(
+    candidates,
+    "baseSalary",
+    original,
+    confidence,
+    [
+      /\b(?:base(?: salary)?|salary|cash comp(?:ensation)?)\s*(?:would be|will be|is|at|of|around|about|to|=)?\s*\$?\s*([\d,.]+)\s*([kKmM])?\b/i,
+      /\$?\s*([\d,.]+)\s*([kKmM])?\s*(?:base(?: salary)?|salary|cash comp(?:ensation)?)/i
+    ]
+  );
+  collectAmountCandidates(
+    candidates,
+    "signingBonus",
+    original,
+    confidence,
+    [
+      /\b(?:sign(?:ing)?(?: |-)?bonus|sign(?: |-)?on)\s*(?:would be|will be|is|at|of|around|about|to|=)?\s*\$?\s*([\d,.]+)\s*([kKmM])?\b/i,
+      /\$?\s*([\d,.]+)\s*([kKmM])?\s*(?:sign(?:ing)?(?: |-)?bonus|sign(?: |-)?on)/i
+    ]
+  );
+
+  const equityMatch =
+    original.match(/\b(?:equity|rsus?|stock|shares?)\s*(?:would be|will be|is|at|of|around|about|to|=)?\s*(\$?\s*[\d,.]+\s*[kKmM]?|\d[\d,.]*\s*(?:rsus|shares))/i) ||
+    original.match(/(\$?\s*[\d,.]+\s*[kKmM]?|\d[\d,.]*\s*(?:rsus|shares))\s*(?:in\s+)?(?:equity|rsus?|stock|shares)/i);
+  if (equityMatch) {
+    candidates.push({
+      field: "equity",
+      value: normalizeEquityValue(equityMatch[1] || equityMatch[0], original),
+      score: confidence + 1
+    });
+  }
+
+  if (/\b(pto|vacation|time off)\b/i.test(original)) {
+    const ptoMatch = original.match(/\b(unlimited(?:\s+pto)?|\d+\s*(?:days?|weeks?))\b/i);
+    if (ptoMatch) {
+      candidates.push({
+        field: "pto",
+        value: normalizePtoValue(ptoMatch[1]),
+        score: confidence + 1
+      });
+    }
+  }
+
+  if (/\b(location|based|office|remote|hybrid|onsite|on-site|relocation|work from)\b/.test(lower)) {
+    const locationCandidate = extractLocationCandidate(original, lower);
+    if (locationCandidate) {
+      candidates.push({
+        field: "location",
+        value: locationCandidate,
+        score: confidence + 1
+      });
+    }
+  }
+
+  if (/\b(team|org|organization|group|joining|join)\b/.test(lower)) {
+    const teamCandidate = extractTeamCandidate(original);
+    if (teamCandidate) {
+      candidates.push({
+        field: "team",
+        value: teamCandidate,
+        score: confidence + 1
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function collectAmountCandidates(candidates, field, text, confidence, patterns) {
+  patterns.forEach((pattern) => {
+    const match = text.match(pattern);
+    if (!match) {
+      return;
+    }
+
+    candidates.push({
+      field,
+      value: formatMoneyValue(match[1], match[2]),
+      score: confidence + 1
+    });
+  });
+}
+
+function getOfferLineConfidence(lower) {
+  let score = 1;
+
+  if (/\b(offer|package|comes with|includes|approved|approval|we can do|could do|would be|will be|the role is|team is|location is|based in)\b/.test(lower)) {
+    score += 2;
+  } else if (/\b(can do|range|band|policy|highest|flexibility|for this role|for the role)\b/.test(lower)) {
+    score += 1;
+  }
+
+  return score;
+}
+
+function isQuestionLikeLine(lower) {
+  return /\?$/.test(lower) || /^(what|which|is|are|can|could|would|will|do|does|did|where|when|how)\b/.test(lower);
+}
+
+function addOfferCandidate(bucket, field, rawValue, score, index) {
+  const value = normalizeOfferTermValue(field, rawValue);
+  if (!value) {
+    return;
+  }
+
+  const existing = bucket.get(value) || { score: 0, count: 0, lastSeen: -1 };
+  existing.score += score;
+  existing.count += 1;
+  existing.lastSeen = index;
+  bucket.set(value, existing);
+}
+
+function pickConfirmedOfferCandidate(field, bucket, currentValue) {
+  const entries = [...bucket.entries()]
+    .map(([value, meta]) => ({ value, ...meta }))
+    .sort((left, right) => right.score - left.score || right.lastSeen - left.lastSeen || right.count - left.count);
+
+  if (!entries.length) {
+    return "";
+  }
+
+  const currentNormalized = normalizeOfferTermValue(field, currentValue);
+  const best = entries[0];
+  const second = entries[1];
+  const threshold = field === "team" || field === "location" ? 4 : 3;
+
+  if (currentNormalized && best.value === currentNormalized) {
+    return currentValue;
+  }
+  if (best.score < threshold) {
+    return currentValue;
+  }
+  if (second && best.value !== currentNormalized && best.score <= second.score) {
+    return currentValue;
+  }
+
+  return best.value;
+}
+
+function normalizeOfferTermValue(field, value) {
+  const text = normalizeShortText(value || "", 60);
+  if (!text || isUnknownValue(text)) {
+    return "";
+  }
+
+  if (field === "baseSalary" || field === "signingBonus") {
+    const parsed = parseMoneyAmount(text);
+    return parsed !== null ? formatCompactMoney(parsed) : normalizeShortText(text, 24);
+  }
+
+  if (field === "equity") {
+    return normalizeEquityValue(text, text);
+  }
+
+  if (field === "location") {
+    const lower = text.toLowerCase();
+    if (/\bsan francisco\b|\bsf\b|\bbay area\b/.test(lower)) {
+      return "SF";
+    }
+    if (/\bnew york\b|\bnyc\b|\bny\b/.test(lower)) {
+      return "NY";
+    }
+    if (/\bremote\b/.test(lower)) {
+      return "Remote";
+    }
+    if (/\bhybrid\b/.test(lower)) {
+      return "Hybrid";
+    }
+    if (/\bon-?site\b/.test(lower)) {
+      return "On-site";
+    }
+    return titleCaseValue(text);
+  }
+
+  if (field === "pto") {
+    return normalizePtoValue(text);
+  }
+
+  if (field === "team") {
+    return normalizeTeamValue(text);
+  }
+
+  return text;
+}
+
+function normalizeEquityValue(value, lineText) {
+  const compact = normalizeShortText(String(value || "").replace(/\s+/g, " "), 36);
+  const lowerLine = String(lineText || "").toLowerCase();
+  const parsedMoney = parseMoneyAmount(compact);
+
+  if (parsedMoney !== null && /\brsu|rsus|equity|stock|shares\b/.test(lowerLine)) {
+    if (/\brsu|rsus\b/.test(lowerLine)) {
+      return `${formatCompactMoney(parsedMoney)} RSUs`;
+    }
+    return `${formatCompactMoney(parsedMoney)} equity`;
+  }
+
+  return compact.replace(/\bRsus\b/, "RSUs");
+}
+
+function normalizePtoValue(value) {
+  const lower = String(value || "").toLowerCase();
+  if (lower.includes("unlimited")) {
+    return "Unlimited PTO";
+  }
+  const match = lower.match(/(\d+\s*(?:days?|weeks?))/);
+  return match ? titleCaseValue(match[1]) : titleCaseValue(value);
+}
+
+function extractLocationCandidate(text, lower) {
+  const cityMatch =
+    text.match(/\b(?:based in|location is|role is in|office is in|working from|work from|located in)\s+(san francisco|sf|bay area|new york|nyc|seattle|austin|boston|chicago|los angeles)\b/i) ||
+    text.match(/\b(?:san francisco|sf|bay area|new york|nyc|seattle|austin|boston|chicago|los angeles)\b/i);
+
+  if (cityMatch) {
+    return normalizeOfferTermValue("location", cityMatch[1] || cityMatch[0]);
+  }
+  if (/\bremote\b/.test(lower)) {
+    return "Remote";
+  }
+  if (/\bhybrid\b/.test(lower)) {
+    return "Hybrid";
+  }
+  if (/\bon-?site\b/.test(lower)) {
+    return "On-site";
+  }
+  return "";
+}
+
+function extractTeamCandidate(text) {
+  const teamMatch =
+    text.match(/(?:join|joining|on|within)\s+(?:the\s+)?([A-Za-z][A-Za-z/& -]{2,40})\s+(?:team|org|group)\b/i) ||
+    text.match(/(?:team|org|group)\s+(?:would be|will be|is)\s+([A-Za-z][A-Za-z/& -]{2,40})\b/i);
+
+  if (!teamMatch) {
+    return "";
+  }
+
+  return normalizeTeamValue(teamMatch[1]);
+}
+
+function normalizeTeamValue(value) {
+  const cleaned = normalizeShortText(String(value || ""), 32)
+    .replace(/\bcourt distributed\b/i, "Core Distributed")
+    .replace(/\bml infrastructure\b/i, "ML Infra");
+  const lower = cleaned.toLowerCase();
+
+  if (!cleaned || /\b(hr|recruiter|manager|hiring manager|director|exec)\b/.test(lower)) {
+    return "";
+  }
+
+  return titleCaseValue(cleaned).replace(/\bMl\b/g, "ML").replace(/\bInfra\b/g, "Infra");
+}
+
+function titleCaseValue(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\b([a-z])/g, (match) => match.toUpperCase())
+    .replace(/\bSf\b/g, "SF")
+    .replace(/\bNy\b/g, "NY")
+    .replace(/\bRsus\b/g, "RSUs")
+    .trim();
+}
+
+function formatMoneyValue(numberPart, suffixPart) {
+  const parsed = parseMoneyAmount(`${numberPart}${suffixPart || ""}`);
+  return parsed !== null ? formatCompactMoney(parsed) : "";
 }

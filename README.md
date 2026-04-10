@@ -57,7 +57,7 @@ NegotiateAI is a Chrome extension prototype for Google Meet that:
 
 Default prototype models:
 
-- OpenAI: `gpt-4.1-mini`
+- OpenAI: `gpt-5.4-mini`
 - Claude: `claude-sonnet-4-20250514`
 
 ## Start a live session
