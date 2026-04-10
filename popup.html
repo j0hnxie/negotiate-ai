@@ -3,58 +3,85 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Negotiation Copilot</title>
+    <title>NegotiateAI</title>
     <style>
       body {
-        font: 13px/1.4 "Segoe UI", Roboto, sans-serif;
+        width: 310px;
         margin: 0;
-        padding: 12px;
-        width: 280px;
-        background: #f8fafc;
-        color: #0f172a;
+        padding: 16px;
+        background: #0b0f16;
+        color: #edf1ff;
+        font: 14px/1.45 "Avenir Next", "Segoe UI Variable", "Helvetica Neue", sans-serif;
       }
 
-      h1 {
-        margin: 0 0 10px;
-        font-size: 15px;
+      .brand {
+        font-size: 24px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        background: linear-gradient(90deg, #19ddb0, #7e7dff);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        margin-bottom: 6px;
       }
 
       p {
-        margin: 0 0 10px;
-        color: #475569;
+        margin: 0 0 12px;
+        color: rgba(184, 192, 221, 0.72);
+      }
+
+      .status {
+        border: 1px solid rgba(129, 140, 248, 0.14);
+        border-radius: 16px;
+        background: #141925;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+
+      .status strong {
+        display: block;
+        margin-bottom: 4px;
+        color: #ffffff;
       }
 
       button {
         width: 100%;
-        border: 1px solid #cbd5e1;
-        border-radius: 8px;
-        background: #ffffff;
-        padding: 8px 10px;
+        border: 0;
+        border-radius: 14px;
+        padding: 12px 14px;
         font: inherit;
+        font-weight: 700;
         cursor: pointer;
-        margin-bottom: 8px;
+        margin-bottom: 10px;
       }
 
-      #toggleBtn {
-        background: #0f766e;
-        color: #ffffff;
-        border-color: #0f766e;
+      #setupBtn {
+        background: linear-gradient(90deg, #12d8a2, #69efb1);
+        color: #041019;
       }
 
-      #status {
-        min-height: 18px;
-        font-size: 12px;
-        color: #334155;
+      .secondary {
+        background: #1b2030;
+        color: #edf1ff;
+        border: 1px solid rgba(129, 140, 248, 0.14);
       }
     </style>
   </head>
   <body>
-    <h1>Negotiation Copilot</h1>
-    <p id="blurb">Open a Google Meet tab to use live coaching.</p>
-    <button id="toggleBtn" type="button" disabled>Pause coach</button>
-    <button id="resetBtn" type="button" disabled>Reset transcript</button>
-    <button id="settingsBtn" type="button">Open settings</button>
-    <div id="status"></div>
+    <div class="brand">NegotiateAI</div>
+    <p>Open a Google Meet tab to launch the live negotiation overlay.</p>
+
+    <div class="status">
+      <strong id="sessionState">Checking active tab...</strong>
+      <div id="providerState"></div>
+      <div id="detailState" style="margin-top: 6px;"></div>
+    </div>
+
+    <button id="setupBtn" type="button" disabled>Open quick setup</button>
+    <button id="toggleBtn" class="secondary" type="button" disabled>Pause suggestions</button>
+    <button id="resetBtn" class="secondary" type="button" disabled>Reset transcript</button>
+    <button id="settingsBtn" class="secondary" type="button">Open settings</button>
+
     <script src="popup.js"></script>
   </body>
 </html>

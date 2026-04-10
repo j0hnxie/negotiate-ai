@@ -1,7 +1,9 @@
 const ids = {
-  apiKey: document.getElementById("apiKey"),
-  goals: document.getElementById("goals"),
-  counterpartProfile: document.getElementById("counterpartProfile"),
+  providerInputs: Array.from(document.querySelectorAll('input[name="provider"]')),
+  openaiApiKey: document.getElementById("openaiApiKey"),
+  openaiModel: document.getElementById("openaiModel"),
+  anthropicApiKey: document.getElementById("anthropicApiKey"),
+  anthropicModel: document.getElementById("anthropicModel"),
   previousEmails: document.getElementById("previousEmails"),
   previousDocs: document.getElementById("previousDocs"),
   personalExperience: document.getElementById("personalExperience"),
@@ -13,34 +15,49 @@ const ids = {
 };
 
 async function loadSettings() {
-  const data = await chrome.storage.local.get(["openaiApiKey", "negotiationContext"]);
-  const context = data.negotiationContext || {};
+  const data = await chrome.storage.local.get([
+    "provider",
+    "openaiApiKey",
+    "openaiModel",
+    "anthropicApiKey",
+    "anthropicModel",
+    "contextLibrary"
+  ]);
 
-  ids.apiKey.value = data.openaiApiKey || "";
-  ids.goals.value = context.goals || "";
-  ids.counterpartProfile.value = context.counterpartProfile || "";
-  ids.previousEmails.value = context.previousEmails || "";
-  ids.previousDocs.value = context.previousDocs || "";
-  ids.personalExperience.value = context.personalExperience || "";
+  const provider = data.provider || "openai";
+  ids.providerInputs.forEach((input) => {
+    input.checked = input.value === provider;
+  });
+
+  ids.openaiApiKey.value = data.openaiApiKey || "";
+  ids.openaiModel.value = data.openaiModel || "gpt-4.1-mini";
+  ids.anthropicApiKey.value = data.anthropicApiKey || "";
+  ids.anthropicModel.value = data.anthropicModel || "claude-sonnet-4-20250514";
+  ids.previousEmails.value = data.contextLibrary?.previousEmails || "";
+  ids.previousDocs.value = data.contextLibrary?.previousDocs || "";
+  ids.personalExperience.value = data.contextLibrary?.personalExperience || "";
 }
 
 async function saveSettings() {
-  const payload = {
-    openaiApiKey: ids.apiKey.value.trim(),
-    negotiationContext: {
-      goals: ids.goals.value.trim(),
-      counterpartProfile: ids.counterpartProfile.value.trim(),
+  const provider = ids.providerInputs.find((input) => input.checked)?.value || "openai";
+
+  await chrome.storage.local.set({
+    provider,
+    openaiApiKey: ids.openaiApiKey.value.trim(),
+    openaiModel: ids.openaiModel.value.trim() || "gpt-4.1-mini",
+    anthropicApiKey: ids.anthropicApiKey.value.trim(),
+    anthropicModel: ids.anthropicModel.value.trim() || "claude-sonnet-4-20250514",
+    contextLibrary: {
       previousEmails: ids.previousEmails.value.trim(),
       previousDocs: ids.previousDocs.value.trim(),
       personalExperience: ids.personalExperience.value.trim()
     }
-  };
+  });
 
-  await chrome.storage.local.set(payload);
   ids.status.textContent = "Saved";
-  setTimeout(() => {
+  window.setTimeout(() => {
     ids.status.textContent = "";
-  }, 1500);
+  }, 1600);
 }
 
 function bindFileImport(inputEl, textareaEl) {
@@ -50,16 +67,23 @@ function bindFileImport(inputEl, textareaEl) {
       return;
     }
 
-    const text = await file.text();
-    const existing = textareaEl.value.trim();
-    textareaEl.value = existing ? `${existing}\n\n---\n${text.trim()}` : text.trim();
+    const text = (await file.text()).trim();
+    if (!text) {
+      inputEl.value = "";
+      return;
+    }
+
+    textareaEl.value = textareaEl.value.trim() ? `${textareaEl.value.trim()}\n\n---\n${text}` : text;
     inputEl.value = "";
   });
 }
 
-ids.saveBtn.addEventListener("click", saveSettings);
+ids.saveBtn.addEventListener("click", () => {
+  void saveSettings();
+});
+
 bindFileImport(ids.emailsFile, ids.previousEmails);
 bindFileImport(ids.docsFile, ids.previousDocs);
 bindFileImport(ids.experienceFile, ids.personalExperience);
 
-loadSettings();
+void loadSettings();

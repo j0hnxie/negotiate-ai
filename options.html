@@ -3,74 +3,107 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Negotiation Copilot Settings</title>
+    <title>NegotiateAI Settings</title>
     <link rel="stylesheet" href="options.css" />
   </head>
   <body>
-    <main>
-      <h1>Negotiation Copilot Settings</h1>
-      <p>
-        Add your API key and preload context so the assistant can provide negotiation strategies based on your
-        history.
-      </p>
-
-      <section class="card">
-        <label for="apiKey">OpenAI API key</label>
-        <input id="apiKey" type="password" placeholder="sk-..." />
+    <main class="shell">
+      <section class="hero">
+        <div class="brand">NegotiateAI</div>
+        <p class="hero-copy">
+          Configure the model provider and preload optional background context. The quick meeting setup happens inside
+          Google Meet.
+        </p>
       </section>
 
       <section class="card">
-        <label for="goals">Negotiation goals</label>
-        <textarea id="goals" rows="4" placeholder="Outcome you want, constraints, red lines..."></textarea>
-
-        <label for="counterpartProfile">Counterpart profile</label>
-        <textarea
-          id="counterpartProfile"
-          rows="4"
-          placeholder="Known incentives, power dynamics, objections, style..."
-        ></textarea>
-      </section>
-
-      <section class="card">
-        <div class="field-head">
-          <label for="previousEmails">Previous email threads</label>
-          <input id="emailsFile" type="file" accept=".txt,.md,.csv" />
+        <div class="section-head">
+          <h2>Model provider</h2>
+          <p>Pick one provider, then add the matching API key.</p>
         </div>
-        <textarea id="previousEmails" rows="8" placeholder="Paste email thread excerpts..."></textarea>
+
+        <div class="provider-grid">
+          <label class="provider-card">
+            <input type="radio" name="provider" value="openai" />
+            <span>OpenAI</span>
+            <small>Uses the Responses API.</small>
+          </label>
+          <label class="provider-card">
+            <input type="radio" name="provider" value="anthropic" />
+            <span>Claude</span>
+            <small>Uses Anthropic Messages.</small>
+          </label>
+        </div>
+
+        <div class="provider-fields">
+          <div>
+            <label for="openaiApiKey">OpenAI API key</label>
+            <input id="openaiApiKey" type="password" placeholder="sk-..." />
+          </div>
+          <div>
+            <label for="openaiModel">OpenAI model</label>
+            <input id="openaiModel" type="text" placeholder="gpt-4.1-mini" />
+          </div>
+          <div>
+            <label for="anthropicApiKey">Claude API key</label>
+            <input id="anthropicApiKey" type="password" placeholder="sk-ant-..." />
+          </div>
+          <div>
+            <label for="anthropicModel">Claude model</label>
+            <input id="anthropicModel" type="text" placeholder="claude-sonnet-4-20250514" />
+          </div>
+        </div>
       </section>
 
       <section class="card">
-        <div class="field-head">
-          <label for="previousDocs">Previous documents</label>
-          <input id="docsFile" type="file" accept=".txt,.md,.csv" />
+        <div class="section-head">
+          <h2>Background context</h2>
+          <p>Optional. This is applied automatically alongside the quick setup form in Meet.</p>
         </div>
-        <textarea id="previousDocs" rows="8" placeholder="Paste relevant notes/contract text/briefs..."></textarea>
+
+        <div class="field-block">
+          <div class="field-head">
+            <label for="previousEmails">Previous email threads</label>
+            <input id="emailsFile" type="file" accept=".txt,.md,.csv" />
+          </div>
+          <textarea id="previousEmails" rows="7" placeholder="Paste short email excerpts or import a text file."></textarea>
+        </div>
+
+        <div class="field-block">
+          <div class="field-head">
+            <label for="previousDocs">Previous documents</label>
+            <input id="docsFile" type="file" accept=".txt,.md,.csv" />
+          </div>
+          <textarea id="previousDocs" rows="7" placeholder="Offer notes, compensation ranges, contract language, or prep notes."></textarea>
+        </div>
+
+        <div class="field-block">
+          <div class="field-head">
+            <label for="personalExperience">Personal negotiation experience</label>
+            <input id="experienceFile" type="file" accept=".txt,.md,.csv" />
+          </div>
+          <textarea
+            id="personalExperience"
+            rows="6"
+            placeholder="What tactics work for you, where you tend to concede, and what you want the assistant to notice."
+          ></textarea>
+        </div>
       </section>
 
-      <section class="card">
-        <div class="field-head">
-          <label for="personalExperience">Your personal negotiation experience</label>
-          <input id="experienceFile" type="file" accept=".txt,.md,.csv" />
+      <section class="card note-card">
+        <div class="section-head">
+          <h2>Prototype note</h2>
+          <p>
+            This prototype sends transcript content directly from the extension to the selected provider API. For
+            real-world deployment, move provider calls behind your own backend.
+          </p>
         </div>
-        <textarea
-          id="personalExperience"
-          rows="6"
-          placeholder="What has worked for you before, strengths, blind spots..."
-        ></textarea>
       </section>
 
       <div class="actions">
         <button id="saveBtn" type="button">Save settings</button>
         <span id="status"></span>
       </div>
-
-      <section class="card warning">
-        <h2>Privacy and consent</h2>
-        <p>
-          This extension sends transcript content and your context to OpenAI when generating advice. Make sure all
-          participants consent to transcription and AI assistance before use.
-        </p>
-      </section>
     </main>
 
     <script src="options.js"></script>
