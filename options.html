@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Negotiation Copilot Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Negotiation Copilot Settings</h1>
+      <p>
+        Add your API key and preload context so the assistant can provide negotiation strategies based on your
+        history.
+      </p>
+
+      <section class="card">
+        <label for="apiKey">OpenAI API key</label>
+        <input id="apiKey" type="password" placeholder="sk-..." />
+      </section>
+
+      <section class="card">
+        <label for="goals">Negotiation goals</label>
+        <textarea id="goals" rows="4" placeholder="Outcome you want, constraints, red lines..."></textarea>
+
+        <label for="counterpartProfile">Counterpart profile</label>
+        <textarea
+          id="counterpartProfile"
+          rows="4"
+          placeholder="Known incentives, power dynamics, objections, style..."
+        ></textarea>
+      </section>
+
+      <section class="card">
+        <div class="field-head">
+          <label for="previousEmails">Previous email threads</label>
+          <input id="emailsFile" type="file" accept=".txt,.md,.csv" />
+        </div>
+        <textarea id="previousEmails" rows="8" placeholder="Paste email thread excerpts..."></textarea>
+      </section>
+
+      <section class="card">
+        <div class="field-head">
+          <label for="previousDocs">Previous documents</label>
+          <input id="docsFile" type="file" accept=".txt,.md,.csv" />
+        </div>
+        <textarea id="previousDocs" rows="8" placeholder="Paste relevant notes/contract text/briefs..."></textarea>
+      </section>
+
+      <section class="card">
+        <div class="field-head">
+          <label for="personalExperience">Your personal negotiation experience</label>
+          <input id="experienceFile" type="file" accept=".txt,.md,.csv" />
+        </div>
+        <textarea
+          id="personalExperience"
+          rows="6"
+          placeholder="What has worked for you before, strengths, blind spots..."
+        ></textarea>
+      </section>
+
+      <div class="actions">
+        <button id="saveBtn" type="button">Save settings</button>
+        <span id="status"></span>
+      </div>
+
+      <section class="card warning">
+        <h2>Privacy and consent</h2>
+        <p>
+          This extension sends transcript content and your context to OpenAI when generating advice. Make sure all
+          participants consent to transcription and AI assistance before use.
+        </p>
+      </section>
+    </main>
+
+    <script src="options.js"></script>
+  </body>
+</html>
