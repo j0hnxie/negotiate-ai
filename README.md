@@ -1,131 +1,272 @@
 # NegotiateAI
 
-NegotiateAI is a Chrome extension prototype for Google Meet that:
+NegotiateAI is a Chrome extension prototype for Google Meet. It watches live Meet captions, combines them with your negotiation context, sends that rolling state to OpenAI or Claude, and shows a compact in-call overlay with:
 
-- shows a compact live negotiation rail on the right
-- shows a compact live captions rail on the left
-- captures Google Meet captions as the conversation happens
-- sends rolling context to OpenAI or Claude
-- renders short tactical guidance, market research, goal progress, and live offer terms
+- negotiation strategy
+- market research
+- goal tracking
+- live offer terms
+- recent captions
 
-## What changed
+This project is a prototype. It is useful for demos and local testing, but it is not production-hardened.
 
-- Rebranded the extension to `NegotiateAI`
-- Added a centered quick-setup modal in Meet that matches the reference UI direction
-- Replaced raw markdown advice with a structured panel:
-  - strategy
-  - market research
-  - leverage
-  - goal checklist
-  - offer terms
-  - watchouts
-- Added provider selection for `OpenAI` or `Claude`
-- Added a paused state that collapses the overlay into a small resume pill
-- Added a left-side captions panel
-- Changed the UI so it only appears after you actually join the call
-- Reset per-meeting context when a new Meet link is opened
+## What You Need
 
-## Files
+Before using the extension, make sure you have:
 
-- [manifest.json](/Users/johnxie/Documents/College/594/594-final-project/manifest.json)
-- [background.js](/Users/johnxie/Documents/College/594/594-final-project/background.js)
-- [content.js](/Users/johnxie/Documents/College/594/594-final-project/content.js)
-- [options.html](/Users/johnxie/Documents/College/594/594-final-project/options.html)
-- [options.css](/Users/johnxie/Documents/College/594/594-final-project/options.css)
-- [options.js](/Users/johnxie/Documents/College/594/594-final-project/options.js)
-- [popup.html](/Users/johnxie/Documents/College/594/594-final-project/popup.html)
-- [popup.js](/Users/johnxie/Documents/College/594/594-final-project/popup.js)
+1. Google Chrome
+2. A Google Meet call to test with
+3. An API key for one provider:
+   - OpenAI
+   - Anthropic / Claude
+4. Google Meet captions enabled during the call
 
-## Load it in Chrome
-
-1. Open `chrome://extensions`.
-2. Turn on `Developer mode`.
-3. Click `Load unpacked`.
-4. Select this folder:
-   `/Users/johnxie/Documents/College/594/594-final-project`
-5. Pin the extension if you want quick access from the Chrome toolbar.
-
-## Configure the model provider
-
-1. Open the extension settings page.
-2. Choose one provider:
-   - `OpenAI`
-   - `Claude`
-3. Add the matching API key.
-4. Optionally change the model name.
-5. Save settings.
-
-Default prototype models:
+Default models in this prototype:
 
 - OpenAI: `gpt-5.4-mini`
 - Claude: `claude-sonnet-4-20250514`
 
-## Start a live session
+## Project Files
 
-1. Join a Google Meet call.
-2. Turn on Google Meet captions.
-3. After you are fully in the call, the `NegotiateAI` quick-setup modal will appear over Meet.
-4. Enter the short context:
-   - your field / industry
-   - your title
-   - company
-   - who you are negotiating with
-   - ranked priorities
-   - any short extra context
-5. Click `Start live session`.
+Main extension files:
 
-After that, the live UI will show:
+- `/Users/johnxie/Documents/College/594/594-final-project/manifest.json`
+- `/Users/johnxie/Documents/College/594/594-final-project/background.js`
+- `/Users/johnxie/Documents/College/594/594-final-project/content.js`
+- `/Users/johnxie/Documents/College/594/594-final-project/options.html`
+- `/Users/johnxie/Documents/College/594/594-final-project/options.css`
+- `/Users/johnxie/Documents/College/594/594-final-project/options.js`
+- `/Users/johnxie/Documents/College/594/594-final-project/popup.html`
+- `/Users/johnxie/Documents/College/594/594-final-project/popup.js`
 
-- a left captions panel with recent Meet captions
-- a concise strategy card
-- a market research panel
-- short phrasing suggestions
-- goal checklist progress
-- live offer term cards
-- watchouts
+## Install The Extension In Chrome
 
-You can pause suggestions at any time from:
+Follow these steps exactly:
 
-- the overlay toggle
-- the extension popup
+1. Open Chrome.
+2. Go to `chrome://extensions`.
+3. Turn on `Developer mode` in the top-right.
+4. Click `Load unpacked`.
+5. Select this folder:
+   `/Users/johnxie/Documents/College/594/594-final-project`
+6. Confirm that the extension named `NegotiateAI` appears in the extensions list.
+7. Click the pin icon in Chrome if you want quick access from the toolbar.
 
-When paused, the strategy rail collapses into a small resume pill, while caption capture can continue locally.
+If you change the code later:
 
-If you join a different Google Meet link, NegotiateAI treats it as a new meeting and asks for fresh context again.
+1. Go back to `chrome://extensions`
+2. Click `Reload` on `NegotiateAI`
+3. Refresh the Google Meet tab
 
-## Extra context you can preload
+## Configure API Access
 
-In settings you can optionally paste or import:
+NegotiateAI will not generate advice until you add an API key.
+
+### Option 1: Open settings from Chrome extensions page
+
+1. Open `chrome://extensions`
+2. Find `NegotiateAI`
+3. Click `Details`
+4. Open the extension options page
+
+### Option 2: Open settings from the extension itself
+
+1. Click the NegotiateAI toolbar icon
+2. Open the popup
+3. Use the settings action
+
+### In the settings page
+
+1. Choose a provider:
+   - `OpenAI`
+   - `Claude`
+2. Paste your API key
+3. Leave the default model or enter a different model name
+4. Click `Save`
+
+Optional background context you can preload in settings:
 
 - previous email threads
-- prior negotiation documents
-- your personal negotiation notes
+- previous negotiation documents
+- your own notes or past experience
 
-That background context is added automatically to the live prompt.
+That saved context is automatically included when the extension generates live advice.
 
-## What still needs to be done
+## First-Time Meeting Setup
 
-This prototype is usable, but a production version still needs more work:
+When you join a Google Meet call for a new Meet link, the extension will show a setup popup.
 
-1. Move API calls off the client.
-   Right now the browser extension sends transcript text directly to the provider API using the key stored in extension storage. That is acceptable for a prototype, but not the right security model for production.
-2. Replace DOM-based caption scraping with a more robust transcription pipeline.
-   The current implementation depends on Google Meet caption DOM selectors, so UI changes from Google can break transcript capture.
-3. Add stronger structured extraction for compensation terms.
-   The current term tracker is model-driven and conservative, but it should be backed by stronger validation if accuracy is critical.
-4. Add consent, policy, and audit controls.
-   If this is used in real meetings, you need explicit consent and policy review for transcription and AI assistance.
+Fill in the context briefly:
 
-## Known limitations
+- your field / industry
+- your title
+- company
+- who you are speaking with
+- optional target values for:
+  - base salary
+  - signing bonus
+  - equity
+  - location
+  - PTO
+  - team
+- additional context
 
-- The extension listens through Google Meet captions, not raw audio.
-- No captions means no transcript input.
-- Provider responses are only as strong as the context and transcript quality.
-- Join detection relies on Google Meet control labels, so unusual Meet UI variants may need selector updates.
+Default target values in the popup:
 
-## Provider references
+- Base salary: `150k`
+- Signing bonus: `20k`
+- Equity: `160k of RSUs over 4 years`
+- Location: `NY`
+- PTO: `Unlimited PTO`
+- Team: `ML Infra`
+
+If you click `Hide`, the draft is saved for that Meet link so you can reopen it later with `Open NegotiateAI`.
+
+If you open a different Meet link, the extension treats it as a new meeting and asks for fresh context.
+
+## How To Use NegotiateAI In A Meeting
+
+1. Join a Google Meet call
+2. Turn on Meet captions
+3. Wait for the NegotiateAI setup popup
+4. Enter or confirm your context
+5. Click `Start live session`
+
+Once the session is running, you will see:
+
+- Left panel:
+  - recent Google Meet captions
+- Right panel:
+  - strategy
+  - market research
+  - goals
+  - offer terms
+  - watchouts
+
+### What the panels mean
+
+`Strategy`
+
+- tells you what to discuss next
+- stays focused on bridging the gap between the current offer and your target
+- should not change until the conversation has actually progressed
+
+`Market Research`
+
+- shows a stable topic-specific anchor
+- should only change when the topic changes or the conversation materially advances
+
+`Goals`
+
+- `pending`: not discussed yet
+- `discussed`: it came up, but your target or policy is not met yet
+- `active`: this is the live topic right now
+- `done`: the term appears to have been reached or confirmed
+
+`Offer Terms`
+
+- shows the currently confirmed offer details
+- should not change from a single noisy caption line
+
+## Pause, Resume, Hide
+
+You can control the extension during the call:
+
+- pause suggestions from the right-panel toggle
+- resume from the collapsed pill
+- hide captions from the captions panel
+- bring captions back with `Show captions`
+- reopen hidden setup with `Open NegotiateAI`
+
+## Important Usage Notes
+
+NegotiateAI depends on Meet captions. If captions are off, the assistant has no transcript and should not generate advice.
+
+The extension uses the current meeting context plus your saved provider settings. That means:
+
+- the better your context, the better the advice
+- caption quality affects accuracy
+- noisy captions can still produce extraction mistakes
+
+## Troubleshooting
+
+### The extension does not appear in Meet
+
+Check:
+
+1. You loaded the unpacked extension from `/Users/johnxie/Documents/College/594/594-final-project`
+2. The extension is enabled in `chrome://extensions`
+3. You refreshed the Meet tab after loading or reloading the extension
+4. You have actually joined the call, not just opened the Meet lobby
+
+### The setup popup does not appear
+
+Check:
+
+1. You already joined the meeting
+2. The Meet link is new or the prior session was reset
+3. You did not hide it already
+
+If you hid it, use `Open NegotiateAI`.
+
+### The strategy panel says it is waiting
+
+Check:
+
+1. Your API key is saved
+2. Your provider is selected correctly
+3. Meet captions are enabled
+4. Captions are actually appearing on screen
+
+### Captions are not being picked up
+
+Check:
+
+1. Meet captions are turned on
+2. People are actively speaking
+3. The Meet tab was refreshed after reloading the extension
+
+Important limitation:
+
+- this prototype scrapes Google Meet caption DOM elements
+- if Google changes the Meet caption markup, selectors in `/Users/johnxie/Documents/College/594/594-final-project/content.js` may need updates
+
+### Offer terms look wrong
+
+This can still happen because caption text can be noisy. Reload the extension, continue the call, and let more confirming lines accumulate. The latest version is designed to be more conservative, but it is still a prototype.
+
+## Security And Privacy
+
+This version is a client-side prototype.
+
+That means:
+
+1. transcript text is sent from the extension directly to the configured model provider
+2. API keys are stored in Chrome extension local storage
+3. there is no backend, audit log, or admin control layer
+
+That is acceptable for a demo, but not for production.
+
+## Known Limitations
+
+- The extension listens to Meet captions, not raw audio.
+- No captions means no live transcript input.
+- Accuracy depends on caption quality.
+- Speaker detection depends on the current Meet DOM.
+- Offer-term extraction is conservative, but still imperfect.
+- The UI and selectors may need updates if Google Meet changes.
+
+## Recommended Next Steps For A Production Version
+
+1. Move model calls to a backend
+2. Stop storing production API keys in extension storage
+3. Replace DOM caption scraping with a stronger transcription pipeline
+4. Add structured validation for offer-term extraction
+5. Add explicit consent and policy controls for meeting transcription
+
+## Provider References
 
 - OpenAI Responses API: [platform.openai.com/docs/api-reference/responses/compact?api-mode=responses](https://platform.openai.com/docs/api-reference/responses/compact?api-mode=responses)
-- OpenAI auth guidance: [platform.openai.com/docs/api-reference/authentication?api-mode=responses](https://platform.openai.com/docs/api-reference/authentication?api-mode=responses)
+- OpenAI authentication: [platform.openai.com/docs/api-reference/authentication?api-mode=responses](https://platform.openai.com/docs/api-reference/authentication?api-mode=responses)
 - Anthropic Messages API: [docs.anthropic.com/en/api/messages-examples](https://docs.anthropic.com/en/api/messages-examples)
-- Anthropic API overview: [docs.anthropic.com/en/api/getting-started](https://docs.anthropic.com/en/api/getting-started)
+- Anthropic getting started: [docs.anthropic.com/en/api/getting-started](https://docs.anthropic.com/en/api/getting-started)
