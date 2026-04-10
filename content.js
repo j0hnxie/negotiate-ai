@@ -1,5 +1,6 @@
 let currentMeetingId = getCurrentMeetingId();
 const MEETING_CONTEXT_LOADING_TEXT = "Loading meeting context...";
+const SETUP_DRAFT_STORAGE_PREFIX = "negotiation_setup_draft_";
 const counterpartOptions = [
   "Recruiter",
   "HR Manager",
@@ -26,12 +27,12 @@ const uiState = {
   joined: false,
   setupOpen: false,
   setupDismissed: false,
+  captionsHidden: false,
+  setupDraft: null,
   recentCaptions: []
 };
 
 const transcriptCache = new Set();
-let priorityKeySeed = 0;
-let priorityDraft = [];
 let lastCaptureAt = 0;
 let bootstrapVersion = 0;
 
@@ -59,9 +60,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === "OPEN_SETUP") {
-    fillSetupForm(uiState.snapshot.quickContext || defaultQuickSetup());
-    uiState.setupDismissed = false;
-    openSetupModal(true);
+    void getPreferredSetupData().then((data) => {
+      fillSetupForm(data);
+      uiState.setupDismissed = false;
+      openSetupModal(true);
+    });
     sendResponse({ ok: true });
   }
 });
@@ -86,13 +89,24 @@ async function bootstrap() {
     }
 
     uiState.provider = response.provider;
+    uiState.setupDraft = await loadSetupDraft(meetingId);
+    if (version !== bootstrapVersion || meetingId !== currentMeetingId) {
+      return;
+    }
     applySnapshot(response.snapshot);
+    if (!response.snapshot?.sessionActive && uiState.setupDraft) {
+      fillSetupForm(uiState.setupDraft);
+    }
   } catch (error) {
     if (version !== bootstrapVersion || meetingId !== currentMeetingId) {
       return;
     }
 
-    fillSetupForm(defaultQuickSetup());
+    const draft = await loadSetupDraft(meetingId);
+    if (version !== bootstrapVersion || meetingId !== currentMeetingId) {
+      return;
+    }
+    fillSetupForm(draft || defaultQuickSetup());
     setMetaStatus(normalizeText(error.message, 120));
   } finally {
     if (version === bootstrapVersion && meetingId === currentMeetingId) {
@@ -250,61 +264,6 @@ function createInterface() {
       color: #22f0c2;
     }
 
-    #nai-priority-list {
-      display: grid;
-      gap: 8px;
-      margin-bottom: 10px;
-    }
-
-    .nai-priority-item {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      border: 1px solid rgba(99, 102, 241, 0.16);
-      border-radius: 14px;
-      background: #1d2130;
-      padding: 12px 14px;
-      cursor: grab;
-    }
-
-    .nai-priority-item.nai-dragging {
-      opacity: 0.6;
-    }
-
-    .nai-priority-handle,
-    .nai-priority-rank {
-      color: rgba(148, 163, 184, 0.56);
-      font-family: "SFMono-Regular", "Menlo", monospace;
-      font-size: 11px;
-      letter-spacing: 0.18em;
-    }
-
-    .nai-priority-rank {
-      color: #7e7dff;
-      font-weight: 700;
-    }
-
-    .nai-priority-text {
-      flex: 1;
-      color: #eef2ff;
-      font-size: 14px;
-    }
-
-    .nai-priority-remove {
-      border: 0;
-      background: transparent;
-      color: rgba(148, 163, 184, 0.4);
-      font-size: 18px;
-      cursor: pointer;
-    }
-
-    .nai-priority-composer {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
-    }
-
-    .nai-add-btn,
     .nai-ghost-btn,
     .nai-start-btn,
     .nai-link-btn {
@@ -313,19 +272,23 @@ function createInterface() {
       transition: transform 120ms ease, opacity 120ms ease;
     }
 
-    .nai-add-btn:hover,
     .nai-ghost-btn:hover,
     .nai-start-btn:hover,
     .nai-link-btn:hover {
       transform: translateY(-1px);
     }
 
-    .nai-add-btn {
-      width: 46px;
-      border-radius: 14px;
-      background: #262b3b;
-      color: #ffffff;
-      font-size: 24px;
+    .nai-goal-target-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .nai-goal-target-note {
+      margin-top: 8px;
+      color: rgba(184, 192, 221, 0.56);
+      font-size: 12px;
+      line-height: 1.35;
     }
 
     .nai-footer-row {
@@ -373,9 +336,56 @@ function createInterface() {
       padding: 0;
     }
 
+    #nai-setup-reopen {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      display: none;
+      pointer-events: auto;
+      border: 1px solid rgba(99, 102, 241, 0.18);
+      border-radius: 999px;
+      padding: 11px 14px;
+      background: rgba(10, 13, 22, 0.92);
+      color: rgba(238, 242, 255, 0.96);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      box-shadow: 0 14px 28px rgba(0, 0, 0, 0.24);
+      cursor: pointer;
+    }
+
+    #nai-setup-reopen:hover {
+      border-color: rgba(16, 242, 179, 0.4);
+      color: #22f0c2;
+    }
+
+    #nai-captions-reopen {
+      position: absolute;
+      top: 96px;
+      left: 14px;
+      display: none;
+      pointer-events: auto;
+      border: 1px solid rgba(99, 102, 241, 0.18);
+      border-radius: 999px;
+      padding: 10px 13px;
+      background: rgba(10, 13, 22, 0.92);
+      color: rgba(238, 242, 255, 0.96);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      box-shadow: 0 14px 28px rgba(0, 0, 0, 0.24);
+      cursor: pointer;
+    }
+
+    #nai-captions-reopen:hover {
+      border-color: rgba(16, 242, 179, 0.4);
+      color: #22f0c2;
+    }
+
     #nai-captions-panel,
     #nai-rail {
       position: absolute;
+      display: none;
       pointer-events: auto;
     }
 
@@ -387,9 +397,9 @@ function createInterface() {
 
     #nai-rail {
       top: 8px;
-      bottom: 8px;
+      bottom: 92px;
       right: 14px;
-      width: min(292px, calc(100vw - 28px));
+      width: min(284px, calc(100vw - 28px));
     }
 
     #nai-panel {
@@ -474,6 +484,25 @@ function createInterface() {
       height: 7px;
       border-radius: 999px;
       background: currentColor;
+    }
+
+    .nai-head-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .nai-head-btn {
+      border: 0;
+      background: transparent;
+      color: rgba(184, 192, 221, 0.72);
+      font-size: 11px;
+      cursor: pointer;
+      padding: 0;
+    }
+
+    .nai-head-btn:hover {
+      color: #22f0c2;
     }
 
     .nai-toggle-wrap {
@@ -567,12 +596,23 @@ function createInterface() {
       margin: 9px 0;
     }
 
-    .nai-market-headline,
-    .nai-headline {
+    .nai-strategy-context {
+      margin-top: 8px;
+      border: 1px solid rgba(16, 242, 179, 0.2);
+      border-radius: 12px;
+      padding: 8px 9px;
+      background: rgba(6, 40, 35, 0.6);
+      color: rgba(186, 255, 235, 0.86);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    .nai-market-headline {
       color: #ffb31d;
-      font-size: 16px;
-      font-weight: 800;
-      line-height: 1.15;
+      font-size: 24px;
+      font-weight: 900;
+      line-height: 1.02;
+      letter-spacing: -0.03em;
     }
 
     .nai-list {
@@ -633,6 +673,11 @@ function createInterface() {
       background: rgba(56, 40, 7, 0.42);
     }
 
+    .nai-goal-item.nai-discussed {
+      border-color: rgba(96, 165, 250, 0.24);
+      background: rgba(10, 27, 52, 0.42);
+    }
+
     .nai-goal-dot {
       width: 16px;
       height: 16px;
@@ -649,6 +694,11 @@ function createInterface() {
 
     .nai-goal-item.nai-active .nai-goal-dot {
       border-color: #f6b21a;
+    }
+
+    .nai-goal-item.nai-discussed .nai-goal-dot {
+      border-color: #60a5fa;
+      background: rgba(96, 165, 250, 0.2);
     }
 
     .nai-goal-label {
@@ -753,6 +803,10 @@ function createInterface() {
       .nai-grid-2 {
         grid-template-columns: 1fr;
       }
+
+      .nai-goal-target-grid {
+        grid-template-columns: 1fr;
+      }
     }
 
     @media (max-width: 760px) {
@@ -779,6 +833,8 @@ function createInterface() {
   root.id = "nai-root";
   root.innerHTML = `
     <div id="nai-setup-backdrop"></div>
+    <button id="nai-setup-reopen" type="button">Open NegotiateAI</button>
+    <button id="nai-captions-reopen" type="button">Show captions</button>
 
     <section id="nai-setup-card" aria-label="NegotiateAI setup">
       <div id="nai-brand-word">NegotiateAI</div>
@@ -810,12 +866,16 @@ function createInterface() {
       </div>
 
       <div style="margin-top: 16px;">
-        <div class="nai-label">Your priorities</div>
-        <div id="nai-priority-list"></div>
-        <div class="nai-priority-composer">
-          <input id="nai-priority-input" class="nai-priority-entry" type="text" placeholder="Add a priority and press +" />
-          <button id="nai-priority-add" class="nai-add-btn" type="button">+</button>
+        <div class="nai-label">Optional goals by category</div>
+        <div class="nai-goal-target-grid">
+          <input id="nai-goal-base-salary" class="nai-input" type="text" placeholder="Base salary, e.g. $180k" />
+          <input id="nai-goal-signing-bonus" class="nai-input" type="text" placeholder="Signing bonus, e.g. $40k" />
+          <input id="nai-goal-equity" class="nai-input" type="text" placeholder="Equity, e.g. $150k RSUs" />
+          <input id="nai-goal-location" class="nai-input" type="text" placeholder="Location, e.g. Remote or NYC" />
+          <input id="nai-goal-pto" class="nai-input" type="text" placeholder="PTO, e.g. 20 days" />
+          <input id="nai-goal-team" class="nai-input" type="text" placeholder="Team, e.g. Platform or ML Infra" />
         </div>
+        <div class="nai-goal-target-note">Leave any field empty if you do not have a specific target.</div>
       </div>
 
       <div style="margin-top: 16px;">
@@ -846,6 +906,9 @@ function createInterface() {
               <strong>Captions</strong>
               <div class="nai-live-tag">Live</div>
             </div>
+          </div>
+          <div class="nai-head-actions">
+            <button id="nai-hide-captions" class="nai-head-btn" type="button">Hide</button>
           </div>
         </div>
         <section class="nai-section">
@@ -880,9 +943,8 @@ function createInterface() {
           <div class="nai-section-card nai-strategy-card">
             <div id="nai-strategy-label" class="nai-strategy-label">Waiting</div>
             <div id="nai-strategy-summary" class="nai-strategy-summary">Join the call to start.</div>
+            <div id="nai-strategy-context" class="nai-strategy-context" style="display: none;"></div>
             <ul id="nai-strategy-bullets" class="nai-list"></ul>
-            <ul id="nai-strategy-paths" class="nai-list nai-path-list" style="margin-top: 8px;"></ul>
-            <ul id="nai-phrasing-list" class="nai-list" style="margin-top: 8px;"></ul>
           </div>
         </section>
 
@@ -891,14 +953,6 @@ function createInterface() {
           <div class="nai-section-card">
             <div id="nai-market-headline" class="nai-market-headline">Quick market view</div>
             <ul id="nai-market-list" class="nai-list nai-market-list" style="margin-top: 9px;"></ul>
-          </div>
-        </section>
-
-        <section class="nai-section" id="nai-leverage-section">
-          <div class="nai-section-head">Leverage</div>
-          <div class="nai-section-card">
-            <div id="nai-leverage-headline" class="nai-headline">--</div>
-            <ul id="nai-leverage-bullets" class="nai-list" style="margin-top: 9px;"></ul>
           </div>
         </section>
 
@@ -947,22 +1001,28 @@ function createInterface() {
     root,
     setupBackdrop: root.querySelector("#nai-setup-backdrop"),
     setupCard: root.querySelector("#nai-setup-card"),
+    captionsReopen: root.querySelector("#nai-captions-reopen"),
     captionsPanel: root.querySelector("#nai-captions-panel"),
     captionsList: root.querySelector("#nai-caption-list"),
     captionsEmpty: root.querySelector("#nai-captions-empty"),
+    hideCaptions: root.querySelector("#nai-hide-captions"),
     industry: root.querySelector("#nai-industry"),
     roleTitle: root.querySelector("#nai-role-title"),
     company: root.querySelector("#nai-company"),
     counterpartRow: root.querySelector("#nai-counterpart-row"),
     counterpartNotes: root.querySelector("#nai-counterpart-notes"),
-    priorityList: root.querySelector("#nai-priority-list"),
-    priorityInput: root.querySelector("#nai-priority-input"),
-    priorityAdd: root.querySelector("#nai-priority-add"),
+    goalBaseSalary: root.querySelector("#nai-goal-base-salary"),
+    goalSigningBonus: root.querySelector("#nai-goal-signing-bonus"),
+    goalEquity: root.querySelector("#nai-goal-equity"),
+    goalLocation: root.querySelector("#nai-goal-location"),
+    goalPto: root.querySelector("#nai-goal-pto"),
+    goalTeam: root.querySelector("#nai-goal-team"),
     additionalContext: root.querySelector("#nai-additional-context"),
     setupStatus: root.querySelector("#nai-setup-status"),
     startSession: root.querySelector("#nai-start-session"),
     hideSetup: root.querySelector("#nai-hide-setup"),
     openSettings: root.querySelector("#nai-open-settings"),
+    setupReopen: root.querySelector("#nai-setup-reopen"),
     rail: root.querySelector("#nai-rail"),
     collapsed: root.querySelector("#nai-collapsed"),
     panel: root.querySelector("#nai-panel"),
@@ -971,15 +1031,11 @@ function createInterface() {
     toggleLabel: root.querySelector("#nai-toggle-label"),
     strategyLabel: root.querySelector("#nai-strategy-label"),
     strategySummary: root.querySelector("#nai-strategy-summary"),
+    strategyContext: root.querySelector("#nai-strategy-context"),
     strategyBullets: root.querySelector("#nai-strategy-bullets"),
-    strategyPaths: root.querySelector("#nai-strategy-paths"),
-    phrasingList: root.querySelector("#nai-phrasing-list"),
     marketSection: root.querySelector("#nai-market-section"),
     marketHeadline: root.querySelector("#nai-market-headline"),
     marketList: root.querySelector("#nai-market-list"),
-    leverageSection: root.querySelector("#nai-leverage-section"),
-    leverageHeadline: root.querySelector("#nai-leverage-headline"),
-    leverageBullets: root.querySelector("#nai-leverage-bullets"),
     goalProgress: root.querySelector("#nai-goal-progress"),
     goalList: root.querySelector("#nai-goal-list"),
     termsGrid: root.querySelector("#nai-terms-grid"),
@@ -1003,14 +1059,6 @@ function bindStaticEvents() {
     }
   });
 
-  dom.priorityAdd.addEventListener("click", addPriorityFromInput);
-  dom.priorityInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addPriorityFromInput();
-    }
-  });
-
   dom.startSession.addEventListener("click", async () => {
     const payload = collectSetupForm();
     dom.startSession.disabled = true;
@@ -1030,6 +1078,8 @@ function bindStaticEvents() {
 
       uiState.provider = response.provider;
       uiState.setupDismissed = false;
+      uiState.setupDraft = payload;
+      void clearSetupDraft(currentMeetingId);
       applySnapshot(response.snapshot);
       closeSetupModal();
     } catch (error) {
@@ -1040,13 +1090,36 @@ function bindStaticEvents() {
   });
 
   dom.hideSetup.addEventListener("click", () => {
+    const draft = collectSetupForm();
+    uiState.setupDraft = draft;
+    void saveSetupDraft(currentMeetingId, draft);
     uiState.setupDismissed = true;
     closeSetupModal();
-    setMetaStatus("Setup hidden. Use the extension popup to reopen it.");
+    setMetaStatus("Setup hidden. Use Open NegotiateAI to bring it back.");
   });
 
-  dom.openSettings.addEventListener("click", () => {
-    window.open(chrome.runtime.getURL("options.html"), "_blank", "noopener,noreferrer");
+  dom.openSettings.addEventListener("click", async () => {
+    try {
+      await chrome.runtime.sendMessage({ type: "OPEN_SETTINGS_PAGE" });
+    } catch (_error) {
+      setSetupStatus("Could not open settings. Reload the extension.");
+    }
+  });
+
+  dom.setupReopen.addEventListener("click", async () => {
+    fillSetupForm(await getPreferredSetupData());
+    uiState.setupDismissed = false;
+    openSetupModal(false);
+  });
+
+  dom.hideCaptions.addEventListener("click", () => {
+    uiState.captionsHidden = true;
+    renderVisibility();
+  });
+
+  dom.captionsReopen.addEventListener("click", () => {
+    uiState.captionsHidden = false;
+    renderVisibility();
   });
 
   dom.liveToggle.addEventListener("change", async () => {
@@ -1093,8 +1166,10 @@ function syncMeetingStage() {
     closeSetupModal();
     setMetaStatus("Join the Google Meet call to start NegotiateAI.");
   } else if (!uiState.snapshot.sessionActive && !uiState.setupDismissed && uiState.snapshot.statusText !== MEETING_CONTEXT_LOADING_TEXT) {
-    fillSetupForm(uiState.snapshot.quickContext || defaultQuickSetup());
-    openSetupModal(false);
+    void getPreferredSetupData().then((data) => {
+      fillSetupForm(data);
+      openSetupModal(false);
+    });
   }
 
   renderVisibility();
@@ -1141,8 +1216,10 @@ function applySnapshot(snapshot) {
     renderCaptions();
   }
 
-  if (snapshot.quickContext && !uiState.setupOpen) {
-    fillSetupForm(snapshot.quickContext);
+  if (!uiState.setupOpen) {
+    fillSetupForm(
+      snapshot.sessionActive ? snapshot.quickContext || defaultQuickSetup() : uiState.setupDraft || snapshot.quickContext || defaultQuickSetup()
+    );
   }
 
   if (uiState.joined && !snapshot.sessionActive && !uiState.setupDismissed && snapshot.statusText !== MEETING_CONTEXT_LOADING_TEXT) {
@@ -1157,10 +1234,15 @@ function applySnapshot(snapshot) {
 function renderVisibility() {
   const showSetup = uiState.joined && uiState.setupOpen;
   const showSessionPanels = uiState.joined && uiState.snapshot.sessionActive;
+  const showSetupLauncher = uiState.joined && !uiState.snapshot.sessionActive && !uiState.setupOpen && uiState.setupDismissed;
+  const showCaptions = showSessionPanels && !uiState.captionsHidden;
+  const showCaptionsLauncher = showSessionPanels && uiState.captionsHidden;
 
   dom.setupBackdrop.classList.toggle("nai-open", showSetup);
   dom.setupCard.classList.toggle("nai-open", showSetup);
-  dom.captionsPanel.style.display = showSessionPanels ? "block" : "none";
+  dom.setupReopen.style.display = showSetupLauncher ? "block" : "none";
+  dom.captionsPanel.style.display = showCaptions ? "block" : "none";
+  dom.captionsReopen.style.display = showCaptionsLauncher ? "block" : "none";
   dom.rail.style.display = showSessionPanels ? "block" : "none";
 
   if (!showSessionPanels) {
@@ -1177,35 +1259,20 @@ function renderPanel(panelData) {
   const data = panelData || {};
   const strategy = data.strategy || {};
   const marketResearch = data.marketResearch || {};
-  const leverage = data.leverage || {};
   const goals = Array.isArray(data.goals) ? data.goals : [];
   const terms = data.offerTerms || {};
   const watchouts = Array.isArray(data.watchouts) ? data.watchouts : [];
 
   dom.strategyLabel.textContent = normalizeText(strategy.label || "Waiting", 32);
   dom.strategySummary.textContent = normalizeText(strategy.summary || "Join the call to start.", 92);
+  dom.strategyContext.textContent = normalizeText(strategy.context || "", 110);
+  dom.strategyContext.style.display = strategy.context ? "block" : "none";
   renderSimpleList(dom.strategyBullets, Array.isArray(strategy.bullets) ? strategy.bullets : []);
-  renderSimpleList(
-    dom.strategyPaths,
-    Array.isArray(strategy.paths)
-      ? strategy.paths.map((item) => {
-          const label = normalizeText(item.label || "", 28);
-          const tradeoff = normalizeText(item.tradeoff || "", 60);
-          return tradeoff ? `${label} - ${tradeoff}` : label;
-        })
-      : []
-  );
-  renderSimpleList(dom.phrasingList, Array.isArray(strategy.phrasing) ? strategy.phrasing : []);
 
   dom.marketHeadline.textContent = normalizeText(marketResearch.headline || "Quick market view", 52);
   renderSimpleList(dom.marketList, Array.isArray(marketResearch.bullets) ? marketResearch.bullets : []);
   dom.marketSection.style.display =
     dom.marketList.childElementCount || (marketResearch.headline && marketResearch.headline !== "Quick market view") ? "block" : "none";
-
-  dom.leverageHeadline.textContent = normalizeText(leverage.headline || "--", 40);
-  renderSimpleList(dom.leverageBullets, Array.isArray(leverage.bullets) ? leverage.bullets : []);
-  dom.leverageSection.style.display =
-    (leverage.headline && leverage.headline !== "--") || dom.leverageBullets.childElementCount ? "block" : "none";
 
   const completed = goals.filter((goal) => goal.status === "done").length;
   dom.goalProgress.textContent = `${completed} / ${goals.length}`;
@@ -1240,9 +1307,9 @@ function renderPanel(panelData) {
     ["Base salary", terms.baseSalary || "--"],
     ["Signing bonus", terms.signingBonus || "--"],
     ["Equity", terms.equity || "--"],
-    ["Remote", terms.remote || "--"],
+    ["Location", terms.location || "--"],
     ["PTO", terms.pto || "--"],
-    ["Start date", terms.startDate || "--"]
+    ["Team", terms.team || "--"]
   ];
 
   dom.termsGrid.innerHTML = "";
@@ -1338,9 +1405,10 @@ function defaultQuickSetup() {
     industry: "",
     roleTitle: "",
     company: "",
-    counterpartRole: "Hiring Manager",
+    counterpartRole: "Recruiter",
     counterpartNotes: "",
-    priorities: ["Base salary", "Equity", "Flexibility"],
+    goalTargets: defaultGoalTargets(),
+    priorities: [],
     additionalContext: ""
   };
 }
@@ -1348,7 +1416,11 @@ function defaultQuickSetup() {
 function fillSetupForm(data) {
   const safe = {
     ...defaultQuickSetup(),
-    ...(data || {})
+    ...(data || {}),
+    goalTargets: {
+      ...defaultGoalTargets(),
+      ...((data && data.goalTargets) || {})
+    }
   };
 
   dom.industry.value = safe.industry || "";
@@ -1356,16 +1428,16 @@ function fillSetupForm(data) {
   dom.company.value = safe.company || "";
   dom.counterpartNotes.value = safe.counterpartNotes || "";
   dom.additionalContext.value = safe.additionalContext || "";
+  dom.goalBaseSalary.value = safe.goalTargets.baseSalary || "";
+  dom.goalSigningBonus.value = safe.goalTargets.signingBonus || "";
+  dom.goalEquity.value = safe.goalTargets.equity || "";
+  dom.goalLocation.value = safe.goalTargets.location || "";
+  dom.goalPto.value = safe.goalTargets.pto || "";
+  dom.goalTeam.value = safe.goalTargets.team || "";
 
   for (const chip of dom.counterpartRow.querySelectorAll(".nai-chip")) {
     chip.classList.toggle("nai-active", chip.dataset.value === safe.counterpartRole);
   }
-
-  priorityDraft = (Array.isArray(safe.priorities) ? safe.priorities : defaultQuickSetup().priorities).map((label) => ({
-    id: `priority-${priorityKeySeed += 1}`,
-    label: normalizeText(label, 72)
-  }));
-  renderPriorityList();
 }
 
 function collectSetupForm() {
@@ -1375,85 +1447,88 @@ function collectSetupForm() {
     industry: dom.industry.value.trim(),
     roleTitle: dom.roleTitle.value.trim(),
     company: dom.company.value.trim(),
-    counterpartRole: activeChip?.dataset.value || "Hiring Manager",
+    counterpartRole: activeChip?.dataset.value || "Recruiter",
     counterpartNotes: dom.counterpartNotes.value.trim(),
-    priorities: priorityDraft.map((item) => item.label).filter(Boolean),
+    goalTargets: {
+      baseSalary: dom.goalBaseSalary.value.trim(),
+      signingBonus: dom.goalSigningBonus.value.trim(),
+      equity: dom.goalEquity.value.trim(),
+      location: dom.goalLocation.value.trim(),
+      pto: dom.goalPto.value.trim(),
+      team: dom.goalTeam.value.trim()
+    },
     additionalContext: dom.additionalContext.value.trim()
   };
 }
 
-function addPriorityFromInput() {
-  const value = normalizeText(dom.priorityInput.value, 72);
-  if (!value) {
-    return;
-  }
-
-  priorityDraft.push({
-    id: `priority-${priorityKeySeed += 1}`,
-    label: value
-  });
-  dom.priorityInput.value = "";
-  renderPriorityList();
+function defaultGoalTargets() {
+  return {
+    baseSalary: "150k",
+    signingBonus: "20k",
+    equity: "160k of RSUs over 4 years",
+    location: "NY",
+    pto: "Unlimited PTO",
+    team: "ML Infra"
+  };
 }
 
-function renderPriorityList() {
-  dom.priorityList.innerHTML = "";
+async function getPreferredSetupData() {
+  if (uiState.snapshot.sessionActive && uiState.snapshot.quickContext) {
+    return uiState.snapshot.quickContext;
+  }
 
-  priorityDraft.forEach((item, index) => {
-    const row = document.createElement("div");
-    row.className = "nai-priority-item";
-    row.draggable = true;
-    row.dataset.id = item.id;
-    row.innerHTML = `
-      <div class="nai-priority-handle">::</div>
-      <div class="nai-priority-rank">#${index + 1}</div>
-      <div class="nai-priority-text"></div>
-      <button class="nai-priority-remove" type="button">x</button>
-    `;
+  if (uiState.setupDraft) {
+    return uiState.setupDraft;
+  }
 
-    row.querySelector(".nai-priority-text").textContent = item.label;
-    row.querySelector(".nai-priority-remove").addEventListener("click", () => {
-      priorityDraft = priorityDraft.filter((entry) => entry.id !== item.id);
-      renderPriorityList();
-    });
+  const storedDraft = await loadSetupDraft(currentMeetingId);
+  if (storedDraft) {
+    uiState.setupDraft = storedDraft;
+    return storedDraft;
+  }
 
-    row.addEventListener("dragstart", (event) => {
-      row.classList.add("nai-dragging");
-      event.dataTransfer.setData("text/plain", item.id);
-    });
+  return uiState.snapshot.quickContext || defaultQuickSetup();
+}
 
-    row.addEventListener("dragend", () => {
-      row.classList.remove("nai-dragging");
-    });
+function getSetupDraftStorageKey(meetingId) {
+  const normalizedMeetingId = String(meetingId || "unknown").trim().toLowerCase();
+  return `${SETUP_DRAFT_STORAGE_PREFIX}${encodeURIComponent(normalizedMeetingId || "unknown")}`;
+}
 
-    row.addEventListener("dragover", (event) => {
-      event.preventDefault();
-    });
+async function loadSetupDraft(meetingId) {
+  const key = getSetupDraftStorageKey(meetingId);
+  const stored = await chrome.storage.local.get([key]);
+  const raw = stored[key];
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
 
-    row.addEventListener("drop", (event) => {
-      event.preventDefault();
-      const sourceId = event.dataTransfer.getData("text/plain");
-      reorderPriority(sourceId, item.id);
-    });
+  return {
+    ...defaultQuickSetup(),
+    ...raw,
+    goalTargets: {
+      ...defaultGoalTargets(),
+      ...((raw && raw.goalTargets) || {})
+    }
+  };
+}
 
-    dom.priorityList.appendChild(row);
+async function saveSetupDraft(meetingId, draft) {
+  const key = getSetupDraftStorageKey(meetingId);
+  await chrome.storage.local.set({
+    [key]: {
+      ...defaultQuickSetup(),
+      ...(draft || {}),
+      goalTargets: {
+        ...defaultGoalTargets(),
+        ...(((draft || {}).goalTargets) || {})
+      }
+    }
   });
 }
 
-function reorderPriority(sourceId, targetId) {
-  if (!sourceId || sourceId === targetId) {
-    return;
-  }
-
-  const sourceIndex = priorityDraft.findIndex((item) => item.id === sourceId);
-  const targetIndex = priorityDraft.findIndex((item) => item.id === targetId);
-  if (sourceIndex === -1 || targetIndex === -1) {
-    return;
-  }
-
-  const [moved] = priorityDraft.splice(sourceIndex, 1);
-  priorityDraft.splice(targetIndex, 0, moved);
-  renderPriorityList();
+async function clearSetupDraft(meetingId) {
+  await chrome.storage.local.remove(getSetupDraftStorageKey(meetingId));
 }
 
 function harvestCaptions() {
@@ -1501,7 +1576,9 @@ function handleMeetingLinkChange(nextMeetingId) {
   uiState.recentCaptions = [];
   lastCaptureAt = 0;
   uiState.setupDismissed = false;
+  uiState.captionsHidden = false;
   uiState.setupOpen = false;
+  uiState.setupDraft = null;
   uiState.snapshot = {
     ...uiState.snapshot,
     sessionActive: false,

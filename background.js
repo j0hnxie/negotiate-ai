@@ -2,11 +2,27 @@ const tabStateCache = new Map();
 
 const TRANSCRIPT_STORAGE_PREFIX = "negotiation_tab_state_";
 const MEETING_CONTEXT_STORAGE_PREFIX = "negotiation_meeting_context_";
-const UPDATE_MIN_INTERVAL_MS = 8000;
+const UPDATE_MIN_INTERVAL_MS = 4500;
+const CAPTION_STALE_MS = 20000;
 const MAX_TRANSCRIPT_LINES = 700;
 const MAX_LINES_PER_PROMPT = 160;
 const DEFAULT_OPENAI_MODEL = "gpt-4.1-mini";
 const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
+const GOAL_STOP_WORDS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "from",
+  "your",
+  "their",
+  "this",
+  "that",
+  "role",
+  "offer",
+  "package",
+  "level"
+]);
 
 const SYSTEM_INSTRUCTIONS = [
   "You are NegotiateAI, a live negotiation copilot for Google Meet.",
@@ -14,10 +30,12 @@ const SYSTEM_INSTRUCTIONS = [
   "Do not wrap JSON in markdown fences.",
   "Keep text scan-friendly and short.",
   "Do not write paragraphs longer than 18 words.",
-  "Focus on tactics, options, leverage, and concise phrasing.",
+  "Focus on tactics, next moves, and concise phrasing.",
   "Only mark a goal as done if the transcript clearly indicates it was achieved or explicitly agreed.",
   "Do not invent offer terms. Keep an existing term if the transcript does not update it.",
-  "If data is uncertain, keep it conservative."
+  "If data is uncertain, keep it conservative.",
+  "In strategy, focus on closing the gap between the current offer and the user's target.",
+  "If a lever sounds fixed, pivot to the next best lever instead of re-confirming old facts."
 ].join("\n");
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -98,6 +116,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message?.type === "OPEN_SETTINGS_PAGE") {
+    void chrome.tabs.create({
+      url: chrome.runtime.getURL("options.html"),
+      active: true
+    });
+    sendResponse({ ok: true });
+    return;
+  }
+
   if (message?.type === "PING") {
     sendResponse({ ok: true, service: "background" });
   }
@@ -150,7 +177,7 @@ async function handleStartSession(sender, message) {
   const quickContext = normalizeQuickSetup(message.payload);
 
   state.quickContext = quickContext;
-  state.goals = makeGoalsFromPriorities(quickContext.priorities);
+  state.goals = makeGoalsFromQuickSetup(quickContext);
   state.panelData = makeInitialPanelData(state.goals);
   state.sessionActive = true;
   state.coachEnabled = true;
@@ -163,6 +190,8 @@ async function handleStartSession(sender, message) {
     state.seen = new Set();
     state.offerTerms = defaultOfferTerms();
     state.lastAdviceAt = 0;
+    state.lastCaptionAt = 0;
+    state.marketCache = {};
   } else {
     state.offerTerms = mergeOfferTerms(defaultOfferTerms(), state.offerTerms);
   }
@@ -223,14 +252,28 @@ async function handleTranscriptChunk(sender, message) {
     state.seen = new Set(state.transcript.map((line) => `${line.speaker}|${line.text}`));
   }
 
+  state.lastCaptionAt = Date.now();
+  state.offerTerms = extractOfferTermsFromTranscript(state.transcript, state.offerTerms);
+  state.goals = reconcileGoalsWithTranscript(state.goals, state.transcript, state.offerTerms);
   state.statusText = "Listening live...";
+  const detectedTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
+  const topicChanged = detectedTopic !== (state.currentTopic || "general");
+  state.currentTopic = detectedTopic;
+  const activeGoal = pickActiveGoal(state.goals, state.currentTopic);
+  state.panelData = {
+    ...(state.panelData || makeInitialPanelData(state.goals)),
+    strategy: buildStrategyPanel(state, activeGoal, state.currentTopic),
+    goals: state.goals.map((goal) => ({ ...goal })),
+    offerTerms: { ...state.offerTerms },
+    watchouts: buildWatchouts(state.transcript[state.transcript.length - 1] || null),
+    generatedAt: new Date().toISOString()
+  };
   await persistTabState(tabId);
+  sendStateToTab(tabId, state);
 
   const now = Date.now();
-  if (state.coachEnabled && !state.generating && now - state.lastAdviceAt >= UPDATE_MIN_INTERVAL_MS) {
+  if (state.coachEnabled && !state.generating && (topicChanged || now - state.lastAdviceAt >= UPDATE_MIN_INTERVAL_MS)) {
     await generateAdviceForTab(tabId);
-  } else {
-    sendStateToTab(tabId, state);
   }
 }
 
@@ -262,12 +305,15 @@ async function handleResetSession(tabId) {
   state.seen = new Set();
   state.offerTerms = defaultOfferTerms();
   state.lastAdviceAt = 0;
+  state.lastCaptionAt = 0;
+  state.marketCache = {};
   state.goals = state.goals.map((goal) => ({
     ...goal,
     status: "pending",
     note: ""
   }));
   state.panelData = makeInitialPanelData(state.goals);
+  state.currentTopic = "general";
   state.statusText = "Transcript cleared.";
 
   await persistTabState(tabId);
@@ -278,6 +324,9 @@ async function handleResetSession(tabId) {
 async function generateAdviceForTab(tabId) {
   const state = await getOrCreateTabState(tabId, "unknown");
   if (!state.sessionActive || !state.coachEnabled || !state.transcript.length || state.generating) {
+    return;
+  }
+  if (!state.lastCaptionAt || Date.now() - state.lastCaptionAt > CAPTION_STALE_MS) {
     return;
   }
 
@@ -303,6 +352,7 @@ async function generateAdviceForTab(tabId) {
     state.goals = panelData.goals.map((goal) => ({ ...goal }));
     state.offerTerms = { ...panelData.offerTerms };
     state.panelData = panelData;
+    state.currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
     state.lastAdviceAt = Date.now();
     state.statusText = `Updated ${new Date(state.lastAdviceAt).toLocaleTimeString([], {
       hour: "numeric",
@@ -316,6 +366,7 @@ async function generateAdviceForTab(tabId) {
     state.goals = fallbackPanel.goals.map((goal) => ({ ...goal }));
     state.offerTerms = { ...fallbackPanel.offerTerms };
     state.panelData = fallbackPanel;
+    state.currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
     state.statusText = `Fallback mode: ${normalizeShortText(error.message, 100)}`;
     await persistTabState(tabId);
     sendStateToTab(tabId, state);
@@ -403,10 +454,12 @@ function buildPrompt(state, libraryContext) {
     .slice(-MAX_LINES_PER_PROMPT)
     .map((line) => `[${new Date(line.at).toLocaleTimeString()}] ${line.speaker}: ${line.text}`)
     .join("\n");
+  const currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
 
   const goalPayload = state.goals.map((goal) => ({
     id: goal.id,
     label: goal.label,
+    target: goal.target,
     current_status: goal.status
   }));
 
@@ -418,7 +471,8 @@ function buildPrompt(state, libraryContext) {
       company: state.quickContext.company,
       speaking_with: state.quickContext.counterpartRole,
       counterpart_notes: state.quickContext.counterpartNotes,
-      priorities: state.quickContext.priorities,
+      goal_targets: state.quickContext.goalTargets,
+      legacy_priorities: state.quickContext.priorities,
       additional_context: state.quickContext.additionalContext
     },
     background_context: {
@@ -426,6 +480,7 @@ function buildPrompt(state, libraryContext) {
       previous_documents: trimForPrompt(libraryContext.previousDocs, 2400),
       personal_experience: trimForPrompt(libraryContext.personalExperience, 1800)
     },
+    current_topic: currentTopic,
     current_goals: goalPayload,
     current_offer_terms: state.offerTerms,
     recent_transcript: transcriptText
@@ -438,29 +493,21 @@ function buildPrompt(state, libraryContext) {
     "{",
     '  "strategy": {',
     '    "label": "2-4 words",',
-    '    "stance": "Hold firm | Probe | Concede small | Close | Listen",',
     '    "summary": "max 12 words",',
-    '    "bullets": ["short bullet", "short bullet"],',
-    '    "paths": [{"label": "short option", "tradeoff": "short tradeoff"}],',
-    '    "phrasing": ["short phrase", "short phrase"]',
-    "  },",
-    '  "leverage": {',
-    '    "label": "short label",',
-    '    "headline": "short headline or value",',
-    '    "bullets": ["short bullet", "short bullet", "short bullet"]',
+    '    "bullets": ["clear next move", "clear next move", "clear next move"]',
     "  },",
     '  "market_research": {',
-    '    "headline": "short headline",',
-    '    "bullets": ["short bullet", "short bullet", "short bullet"]',
+    '    "headline": "bold numeric expectation or policy anchor",',
+    '    "bullets": ["market expectation for this topic", "how current discussion compares"]',
     "  },",
-    '  "goals": [{"id": "goal-1", "status": "pending|active|done", "note": "short note"}],',
+    '  "goals": [{"id": "goal-1", "status": "pending|discussed|active|done", "note": "short note"}],',
     '  "offer_terms": {',
     '    "base_salary": "short value",',
     '    "signing_bonus": "short value",',
     '    "equity": "short value",',
-    '    "remote": "short value",',
+    '    "location": "short value",',
     '    "pto": "short value",',
-    '    "start_date": "short value"',
+    '    "team": "short value"',
     "  },",
     '  "watchouts": ["short warning", "short warning"]',
     "}",
@@ -468,11 +515,17 @@ function buildPrompt(state, libraryContext) {
     "Rules:",
     "- Keep all text minimal and easy to scan.",
     "- No paragraphs. Use fragments.",
+    "- Strategy bullets must be concrete next moves, not observations or recaps.",
+    "- Keep strategy bullets to 2-3 items.",
+    "- Focus on how to close the gap between the current term and the user's target.",
+    "- If a lever sounds fixed, stop re-confirming it and pivot to the next best tradeoff.",
+    "- If the counterpart is a recruiter, prefer questions about band, flexibility, approvals, timeline, and tradeoffs.",
     "- Offer terms should stay unchanged if the transcript does not change them.",
     "- Use only the provided goal ids.",
-    "- Mark a goal as active only if it is currently being negotiated.",
-    "- Mark a goal as done only if it appears secured, accepted, or clearly covered.",
-    "- Use market_research for quick external anchors, precedent, or compensation context.",
+    "- Mark a goal as discussed when it came up but the target or policy was not reached yet.",
+    "- Mark a goal as active only for the current live topic.",
+    "- Keep market numbers stable for the same topic within a meeting.",
+    "- Use market_research for one stable numeric anchor and one topic-relevant comparison bullet.",
     "",
     "Data:",
     JSON.stringify(promptBody, null, 2)
@@ -480,13 +533,9 @@ function buildPrompt(state, libraryContext) {
 }
 
 function normalizePanelData(raw, state, contextLibrary) {
-  const base = makeInitialPanelData(state.goals);
-  const strategy = raw?.strategy || {};
-  const leverage = raw?.leverage || {};
-  const marketResearch = raw?.market_research || raw?.marketResearch || {};
   const goalUpdates = Array.isArray(raw?.goals) ? raw.goals : [];
-  const offerTerms = raw?.offer_terms || raw?.offerTerms || {};
-  const nextGoals = state.goals.map((goal, index) => {
+  const mergedOfferTerms = mergeOfferTerms(state.offerTerms, raw?.offer_terms || raw?.offerTerms || {});
+  const draftGoals = state.goals.map((goal, index) => {
     const update =
       goalUpdates.find((item) => String(item?.id || "") === goal.id) ||
       goalUpdates[index] ||
@@ -494,31 +543,33 @@ function normalizePanelData(raw, state, contextLibrary) {
     return {
       id: goal.id,
       label: goal.label,
+      category: goal.category,
+      target: goal.target,
       status: normalizeGoalStatus(update.status || goal.status),
       note: normalizeShortText(update.note || "", 80)
     };
   });
+  const nextGoals = reconcileGoalsWithTranscript(draftGoals, state.transcript, mergedOfferTerms);
+  const currentTopic = detectCurrentTopic(state.transcript, nextGoals, mergedOfferTerms);
+  const activeGoal = pickActiveGoal(nextGoals, currentTopic);
+  const strategyState = {
+    ...state,
+    offerTerms: mergedOfferTerms,
+    goals: nextGoals,
+    currentTopic
+  };
 
   return {
-    strategy: {
-      label: normalizeShortText(strategy.label || base.strategy.label, 40),
-      stance: normalizeShortText(strategy.stance || base.strategy.stance, 24),
-      summary: normalizeShortText(strategy.summary || base.strategy.summary, 80),
-      bullets: normalizeStringArray(strategy.bullets, 3, 90),
-      paths: normalizePathArray(strategy.paths, 2),
-      phrasing: normalizeStringArray(strategy.phrasing, 2, 90)
-    },
-    leverage: {
-      label: normalizeShortText(leverage.label || "Leverage", 28),
-      headline: normalizeShortText(leverage.headline || "", 48),
-      bullets: normalizeStringArray(leverage.bullets, 3, 100)
-    },
-    marketResearch: {
-      headline: normalizeShortText(marketResearch.headline || buildMarketHeadline(state, contextLibrary), 52),
-      bullets: normalizeStringArray(marketResearch.bullets, 3, 100)
-    },
+    strategy: buildStrategyPanel(strategyState, activeGoal, currentTopic),
+    marketResearch: buildStableMarketResearch(
+      strategyState,
+      contextLibrary,
+      mergedOfferTerms,
+      raw?.market_research || raw?.marketResearch || {},
+      state.panelData?.marketResearch
+    ),
     goals: nextGoals,
-    offerTerms: mergeOfferTerms(state.offerTerms, offerTerms),
+    offerTerms: mergedOfferTerms,
     watchouts: normalizeStringArray(raw?.watchouts, 2, 90),
     generatedAt: new Date().toISOString()
   };
@@ -530,9 +581,10 @@ function mergeOfferTerms(currentTerms, updateTerms) {
     base_salary: "baseSalary",
     signing_bonus: "signingBonus",
     equity: "equity",
-    remote: "remote",
+    location: "location",
+    remote: "location",
     pto: "pto",
-    start_date: "startDate"
+    team: "team"
   };
 
   for (const [inputKey, stateKey] of Object.entries(mapping)) {
@@ -549,15 +601,8 @@ function makeInitialPanelData(goals) {
   return {
     strategy: {
       label: "Waiting",
-      stance: "Listen",
       summary: "Start the session to unlock live guidance.",
-      bullets: [],
-      paths: [],
-      phrasing: []
-    },
-    leverage: {
-      label: "Leverage",
-      headline: "",
+      context: "",
       bullets: []
     },
     marketResearch: {
@@ -571,8 +616,32 @@ function makeInitialPanelData(goals) {
   };
 }
 
-function makeGoalsFromPriorities(priorities) {
-  return normalizePriorityList(priorities).map((label, index) => ({
+function makeGoalsFromQuickSetup(quickContext) {
+  const goalTargets = normalizeGoalTargets(quickContext?.goalTargets);
+  const goals = [];
+  const orderedCategories = ["baseSalary", "signingBonus", "equity", "location", "pto", "team"];
+
+  orderedCategories.forEach((category) => {
+    const targetValue = goalTargets[category];
+    if (!targetValue) {
+      return;
+    }
+
+    goals.push({
+      id: `goal-${goals.length + 1}`,
+      label: `${goalLabelForCategory(category)}: ${targetValue}`,
+      category,
+      target: targetValue,
+      status: "pending",
+      note: ""
+    });
+  });
+
+  if (goals.length) {
+    return goals;
+  }
+
+  return normalizePriorityList(quickContext?.priorities).map((label, index) => ({
     id: `goal-${index + 1}`,
     label,
     status: "pending",
@@ -585,9 +654,9 @@ function defaultOfferTerms() {
     baseSalary: "--",
     signingBonus: "--",
     equity: "--",
-    remote: "--",
+    location: "--",
     pto: "--",
-    startDate: "--"
+    team: "--"
   };
 }
 
@@ -596,10 +665,22 @@ function defaultQuickSetup() {
     industry: "",
     roleTitle: "",
     company: "",
-    counterpartRole: "Hiring Manager",
+    counterpartRole: "Recruiter",
     counterpartNotes: "",
-    priorities: ["Base salary", "Equity", "Flexibility"],
+    goalTargets: defaultGoalTargets(),
+    priorities: [],
     additionalContext: ""
+  };
+}
+
+function defaultGoalTargets() {
+  return {
+    baseSalary: "150k",
+    signingBonus: "20k",
+    equity: "160k of RSUs over 4 years",
+    location: "NY",
+    pto: "Unlimited PTO",
+    team: "ML Infra"
   };
 }
 
@@ -746,7 +827,10 @@ async function persistTabState(tabId) {
       goals: state.goals,
       offerTerms: state.offerTerms,
       panelData: state.panelData,
+      marketCache: state.marketCache,
+      currentTopic: state.currentTopic,
       lastAdviceAt: state.lastAdviceAt,
+      lastCaptionAt: state.lastCaptionAt,
       statusText: state.statusText
     }
   });
@@ -759,7 +843,7 @@ async function removeTabState(tabId) {
 
 function hydrateTabState(raw, meetingId) {
   const quickContext = normalizeQuickSetup(raw?.quickContext || defaultQuickSetup());
-  const goals = Array.isArray(raw?.goals) && raw.goals.length ? raw.goals.map(normalizeGoalObject) : makeGoalsFromPriorities(quickContext.priorities);
+  const goals = Array.isArray(raw?.goals) && raw.goals.length ? raw.goals.map(normalizeGoalObject) : makeGoalsFromQuickSetup(quickContext);
   const transcript = Array.isArray(raw?.transcript)
     ? raw.transcript
         .slice(-MAX_TRANSCRIPT_LINES)
@@ -780,7 +864,10 @@ function hydrateTabState(raw, meetingId) {
     goals,
     offerTerms: mergeOfferTerms(defaultOfferTerms(), raw?.offerTerms || {}),
     panelData: makeInitialPanelData(goals),
+    marketCache: normalizeMarketCache(raw?.marketCache),
+    currentTopic: normalizeShortText(raw?.currentTopic || "", 24) || "general",
     lastAdviceAt: Number(raw?.lastAdviceAt || 0),
+    lastCaptionAt: Number(raw?.lastCaptionAt || 0),
     generating: false,
     statusText: normalizeShortText(raw?.statusText || "", 120)
   };
@@ -795,10 +882,13 @@ function resetStateForMeeting(state, meetingId, savedQuickContext = null) {
   state.seen = new Set();
   state.coachEnabled = true;
   state.quickContext = normalizeQuickSetup(savedQuickContext || defaultQuickSetup());
-  state.goals = makeGoalsFromPriorities(state.quickContext.priorities);
+  state.goals = makeGoalsFromQuickSetup(state.quickContext);
   state.offerTerms = defaultOfferTerms();
   state.panelData = makeInitialPanelData(state.goals);
+  state.marketCache = {};
+  state.currentTopic = "general";
   state.lastAdviceAt = 0;
+  state.lastCaptionAt = 0;
   state.generating = false;
   state.sessionActive = Boolean(savedQuickContext);
   state.statusText = savedQuickContext
@@ -905,11 +995,47 @@ function normalizeQuickSetup(input) {
     industry: normalizeShortText(safe.industry || "", 80),
     roleTitle: normalizeShortText(safe.roleTitle || "", 80),
     company: normalizeShortText(safe.company || "", 80),
-    counterpartRole: normalizeShortText(safe.counterpartRole || "Hiring Manager", 40) || "Hiring Manager",
+    counterpartRole: normalizeShortText(safe.counterpartRole || "Recruiter", 40) || "Recruiter",
     counterpartNotes: normalizeShortText(safe.counterpartNotes || "", 200),
+    goalTargets: normalizeGoalTargets(safe.goalTargets || safe.goals || {}),
     priorities: normalizePriorityList(safe.priorities),
     additionalContext: normalizeShortText(safe.additionalContext || "", 350)
   };
+}
+
+function normalizeGoalTargets(rawTargets) {
+  const safe = rawTargets || {};
+  const normalized = defaultGoalTargets();
+
+  for (const key of Object.keys(normalized)) {
+    normalized[key] = normalizeShortText(safe[key] || "", 80);
+  }
+
+  return normalized;
+}
+
+function normalizeMarketCache(rawCache) {
+  const cache = rawCache && typeof rawCache === "object" ? rawCache : {};
+  const normalized = {};
+
+  for (const [topic, value] of Object.entries(cache)) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+
+    const headline = normalizeShortText(value.headline || "", 52);
+    const expectation = normalizeShortText(value.expectation || "", 100);
+    if (!headline && !expectation) {
+      continue;
+    }
+
+    normalized[normalizeShortText(topic, 24) || "general"] = {
+      headline,
+      expectation
+    };
+  }
+
+  return normalized;
 }
 
 function normalizePriorityList(priorities) {
@@ -923,10 +1049,6 @@ function normalizePriorityList(priorities) {
     }
   }
 
-  if (!cleaned.length) {
-    cleaned.push("Base salary");
-  }
-
   return cleaned.slice(0, 6);
 }
 
@@ -934,13 +1056,15 @@ function normalizeGoalObject(goal) {
   return {
     id: typeof goal?.id === "string" ? goal.id : `goal-${Math.random().toString(36).slice(2, 8)}`,
     label: normalizeShortText(goal?.label || "Goal", 80),
+    category: normalizeShortText(goal?.category || classifyGoalLabel(goal?.label || ""), 24),
+    target: normalizeShortText(goal?.target || extractGoalTargetFromLabel(goal?.label || ""), 80),
     status: normalizeGoalStatus(goal?.status || "pending"),
     note: normalizeShortText(goal?.note || "", 80)
   };
 }
 
 function normalizeGoalStatus(status) {
-  if (status === "done" || status === "active") {
+  if (status === "done" || status === "active" || status === "discussed") {
     return status;
   }
   return "pending";
@@ -1036,138 +1160,450 @@ function parseJsonFromModel(text) {
 }
 
 function buildHeuristicPanelData(state, contextLibrary) {
-  const recentTranscript = state.transcript.slice(-8);
-  const latestLine = recentTranscript[recentTranscript.length - 1] || null;
-  const activeGoal = state.goals.find((goal) => goal.status !== "done") || state.goals[0] || null;
   const extractedTerms = extractOfferTermsFromTranscript(state.transcript, state.offerTerms);
-  const nextGoals = state.goals.map((goal) => {
-    const normalizedGoal = goal.label.toLowerCase();
-    const matchedLine = recentTranscript.find((line) => line.text.toLowerCase().includes(normalizedGoal));
-    return {
-      ...goal,
-      status: goal.status === "done" ? "done" : matchedLine ? "active" : "pending",
-      note: goal.status === "done" ? goal.note : matchedLine ? `Mentioned by ${matchedLine.speaker}` : ""
-    };
-  });
+  const nextGoals = reconcileGoalsWithTranscript(state.goals, state.transcript, extractedTerms);
+  const currentTopic = detectCurrentTopic(state.transcript, nextGoals, extractedTerms);
+  const nextActiveGoal = pickActiveGoal(nextGoals, currentTopic);
+  const strategyState = {
+    ...state,
+    offerTerms: extractedTerms,
+    goals: nextGoals,
+    currentTopic
+  };
 
   return {
-    strategy: {
-      label: activeGoal ? "Track next ask" : "Listen",
-      stance: activeGoal ? "Probe" : "Listen",
-      summary: latestLine
-        ? `React to ${normalizeShortText(latestLine.speaker, 20)}'s latest point.`
-        : "Waiting on live captions.",
-      bullets: buildHeuristicBullets(state, latestLine, activeGoal),
-      paths: buildHeuristicPaths(activeGoal),
-      phrasing: buildHeuristicPhrasing(activeGoal)
-    },
-    leverage: {
-      label: "Leverage",
-      headline: buildLeverageHeadline(state, contextLibrary),
-      bullets: buildLeverageBullets(state, contextLibrary)
-    },
-    marketResearch: {
-      headline: buildMarketHeadline(state, contextLibrary),
-      bullets: buildMarketResearchBullets(state, contextLibrary, extractedTerms)
-    },
+    strategy: buildStrategyPanel(strategyState, nextActiveGoal, currentTopic),
+    marketResearch: buildStableMarketResearch(strategyState, contextLibrary, extractedTerms, {}, state.panelData?.marketResearch),
     goals: nextGoals,
     offerTerms: extractedTerms,
-    watchouts: buildWatchouts(latestLine),
+    watchouts: buildWatchouts(state.transcript[state.transcript.length - 1] || null),
     generatedAt: new Date().toISOString()
   };
 }
 
-function buildHeuristicBullets(state, latestLine, activeGoal) {
-  const bullets = [];
-  if (latestLine) {
-    bullets.push(`Latest point: ${normalizeShortText(latestLine.text, 82)}`);
+function buildStrategyPanel(state, activeGoal, currentTopic) {
+  return {
+    label: buildStrategyLabel(currentTopic, activeGoal),
+    summary: buildStrategySummary(state, activeGoal, currentTopic),
+    context: buildStrategyContext(state),
+    bullets: buildHeuristicBullets(state, activeGoal, currentTopic)
+  };
+}
+
+function buildHeuristicBullets(state, activeGoal, currentTopic) {
+  const bullets = [
+    buildAskNextBullet(state, activeGoal, currentTopic),
+    buildGapBridgeBullet(state, activeGoal, currentTopic),
+    buildPivotBullet(state, activeGoal, currentTopic)
+  ];
+  return dedupeTextArray(bullets).slice(0, 3);
+}
+
+function buildStrategyLabel(currentTopic, activeGoal) {
+  if (currentTopic && currentTopic !== "general") {
+    return `${goalLabelForCategory(currentTopic)} next`;
   }
   if (activeGoal) {
-    bullets.push(`Bring conversation back to ${normalizeShortText(activeGoal.label, 32)}.`);
+    return "Move next";
   }
-  bullets.push("Ask one concrete follow-up before you concede.");
-  return bullets.slice(0, 3);
+  return "Listen";
 }
 
-function buildHeuristicPaths(activeGoal) {
-  if (!activeGoal) {
-    return [{ label: "Clarify", tradeoff: "Get specifics before taking a position." }];
+function buildStrategySummary(state, activeGoal, currentTopic) {
+  const currentValue = getGoalCurrentValue(activeGoal, state.offerTerms);
+  const target = normalizeShortText(activeGoal?.target || "", 42);
+
+  if (currentValue && target && !didGoalReachTarget(activeGoal, currentValue)) {
+    return `Close ${describeGap(activeGoal, currentValue) || "the gap"} before switching.`;
+  }
+  if (activeGoal?.target) {
+    return `Push toward ${normalizeShortText(activeGoal.target, 42)} next.`;
+  }
+  if (currentTopic && currentTopic !== "general") {
+    return `Advance ${goalLabelForCategory(currentTopic).toLowerCase()} now.`;
+  }
+  return "Use one concrete ask at a time.";
+}
+
+function buildAskNextBullet(state, activeGoal, currentTopic) {
+  const recruiterAudience = isRecruiterAudience(state);
+  const hardConstraint = isTopicHoldingFirm(state.transcript, currentTopic);
+
+  if (currentTopic === "baseSalary") {
+    if (hardConstraint) {
+      return recruiterAudience
+        ? "Ask: If base is capped, which approval path or alternate lever can close the gap?"
+        : "Ask: If base is fixed, which comp lever can still move meaningfully?";
+    }
+    return recruiterAudience
+      ? "Ask: What is the highest base you can approve for this level?"
+      : "Ask: What flexibility is still left on base salary here?";
+  }
+  if (currentTopic === "signingBonus") {
+    return "Ask: What sign-on range can you approve if base stays where it is?";
+  }
+  if (currentTopic === "equity") {
+    return recruiterAudience
+      ? "Ask: What equity range is normal for this level, and can this grant move up?"
+      : "Ask: Can we improve the grant size before we trade on base?";
+  }
+  if (currentTopic === "location") {
+    return "Ask: What location policy applies to this role, and who can approve an exception?";
+  }
+  if (currentTopic === "pto") {
+    return "Ask: Is PTO fixed policy at this level, or is there any exception path?";
+  }
+  if (currentTopic === "team") {
+    return "Ask: Which team and reporting line would be on the final offer?";
+  }
+  if (activeGoal) {
+    return `Ask: Can we come back to ${normalizeShortText(activeGoal.label, 48)} before we wrap?`;
+  }
+  return recruiterAudience
+    ? "Ask: Which part of the package can still move today?"
+    : "Ask: Which package lever has the most room left right now?";
+}
+
+function buildGapBridgeBullet(state, activeGoal, currentTopic) {
+  const currentValue = getGoalCurrentValue(activeGoal, state.offerTerms);
+  const target = normalizeShortText(activeGoal?.target || "", 48);
+
+  if (!activeGoal || !target) {
+    return currentTopic === "general" ? "Keep the next ask on one unresolved lever only." : "";
+  }
+
+  if (!currentValue || isUnknownValue(currentValue)) {
+    return `Anchor clearly at ${target} before you trade on another lever.`;
+  }
+
+  if (didGoalReachTarget(activeGoal, currentValue)) {
+    return `That target looks covered at ${currentValue}. Move to the next open goal.`;
+  }
+
+  const gapText = describeGap(activeGoal, currentValue);
+  if (gapText) {
+    return `Bridge ${gapText}. Ask what gets you from ${currentValue} to ${target}.`;
+  }
+
+  return `Current term is ${currentValue}. Restate ${target} and ask how close they can get.`;
+}
+
+function buildPivotBullet(state, activeGoal, currentTopic) {
+  const hardConstraint = isTopicHoldingFirm(state.transcript, currentTopic);
+  if (hardConstraint) {
+    if (currentTopic === "baseSalary" || currentTopic === "signingBonus" || currentTopic === "equity") {
+      return "If they hold firm, trade one comp lever only. Do not reopen settled facts.";
+    }
+    return "If policy sounds fixed, confirm it once and move to the next strongest goal.";
+  }
+
+  if (activeGoal?.target) {
+    return "Stay on this topic until they name a cap, policy, or approval owner.";
+  }
+
+  return "Do not trade two items away to win one.";
+}
+
+function buildHeuristicPaths(state, activeGoal, currentTopic) {
+  const recruiterAudience = isRecruiterAudience(state);
+
+  if (currentTopic === "baseSalary" || currentTopic === "equity" || currentTopic === "signingBonus") {
+    return [
+      {
+        label: recruiterAudience ? "Push approvals" : "Hold one lever",
+        tradeoff: recruiterAudience
+          ? "If that lever is capped, ask which compensating lever can move."
+          : "Keep pressure on the current compensation topic first."
+      }
+    ];
+  }
+
+  if (currentTopic === "location" || currentTopic === "team") {
+    return [
+      {
+        label: "Clarify first",
+        tradeoff: "Lock down expectations before you trade on comp."
+      }
+    ];
+  }
+
+  if (activeGoal) {
+    return [{ label: "Move next", tradeoff: `Advance ${normalizeShortText(activeGoal.label, 30)} before switching topics.` }];
+  }
+
+  return [{ label: "Clarify", tradeoff: "Pick one package lever and make it explicit." }];
+}
+
+function buildHeuristicPhrasing(state, activeGoal, currentTopic) {
+  const recruiterAudience = isRecruiterAudience(state);
+  const goalCategory = currentTopic !== "general" ? currentTopic : classifyGoalLabel(activeGoal?.label || "");
+
+  if (!activeGoal && goalCategory === "custom") {
+    return recruiterAudience
+      ? ["Which part of the package can still move on your side?", "What approvals would be needed to improve it?"]
+      : ["Which package lever should we focus on next?", "Where is there still room to improve the offer?"];
+  }
+
+  if (goalCategory === "baseSalary") {
+    return recruiterAudience
+      ? ["What is the highest base you can get approved for this level?", "If base is capped, which lever can still move today?"]
+      : ["Can we stay on base salary for a minute?", "What flexibility is left on base if we close this soon?"];
+  }
+
+  if (goalCategory === "equity") {
+    return recruiterAudience
+      ? ["What is the normal equity range for this level?", "If base is fixed, can the equity grant move meaningfully?"]
+      : ["Can we go deeper on the equity piece?", "Is there room to improve the grant size here?"];
+  }
+
+  if (goalCategory === "signingBonus") {
+    return ["If base is fixed, can sign-on bridge the gap?", "What sign-on range is realistic for this role?"];
+  }
+
+  if (goalCategory === "location") {
+    return ["What is the actual location expectation for this role?", "Is remote or hybrid still an option for this team?"];
+  }
+
+  if (goalCategory === "pto") {
+    return ["Is PTO fixed policy for this level?", "Is there any flexibility on time off in this offer?"];
+  }
+
+  if (goalCategory === "team") {
+    return ["Which team would I actually be joining?", "How fixed is that team assignment right now?"];
   }
 
   return [
-    { label: "Anchor", tradeoff: `Push directly on ${normalizeShortText(activeGoal.label, 28)}.` },
-    { label: "Trade", tradeoff: "Concede small only for a measurable gain." }
+    `Can we spend a minute on ${normalizeShortText(activeGoal?.label || "that topic", 40)} specifically?`,
+    recruiterAudience ? "What flexibility do you still have there today?" : "What room is left on that item?"
   ];
 }
 
-function buildHeuristicPhrasing(activeGoal) {
-  if (!activeGoal) {
-    return ["Can you walk me through the current package details?"];
-  }
+function goalLabelForCategory(category) {
+  const labels = {
+    baseSalary: "Base salary",
+    signingBonus: "Signing bonus",
+    equity: "Equity",
+    location: "Location",
+    pto: "PTO",
+    team: "Team"
+  };
 
-  return [
-    `Can we spend a minute on ${normalizeShortText(activeGoal.label, 36)} specifically?`,
-    "What room do you have if we solve this today?"
-  ];
+  return labels[category] || "Goal";
 }
 
-function buildLeverageHeadline(state, contextLibrary) {
-  const sources = [
-    state.quickContext.additionalContext,
-    contextLibrary.previousDocs,
-    contextLibrary.previousEmails
-  ].filter(Boolean);
+function extractGoalTargetFromLabel(label) {
+  const text = String(label || "");
+  const parts = text.split(":");
+  return parts.length > 1 ? normalizeShortText(parts.slice(1).join(":").trim(), 80) : "";
+}
 
-  for (const source of sources) {
-    const amount = source.match(/\$[\d,.]+k?/i);
-    if (amount) {
-      return normalizeShortText(amount[0], 36);
+function pickActiveGoal(goals, currentTopic) {
+  if (currentTopic && currentTopic !== "general") {
+    const topicGoal = goals.find((goal) => normalizeGoalStatus(goal.status) !== "done" && classifyGoalLabel(goal.label) === currentTopic);
+    if (topicGoal) {
+      return topicGoal;
     }
   }
 
-  return state.quickContext.company ? `${normalizeShortText(state.quickContext.company, 22)} context` : "Use your priorities";
+  return goals.find((goal) => normalizeGoalStatus(goal.status) !== "done") || goals[0] || null;
 }
 
-function buildLeverageBullets(state, contextLibrary) {
-  const bullets = [];
-  if (state.quickContext.additionalContext) {
-    bullets.push(normalizeShortText(state.quickContext.additionalContext, 92));
+function detectCurrentTopic(transcript, goals, offerTerms) {
+  const recentLines = transcript.slice(-16);
+
+  for (let index = recentLines.length - 1; index >= 0; index -= 1) {
+    const detected = detectTopicFromText(recentLines[index].text);
+    if (detected !== "general") {
+      return detected;
+    }
   }
-  if (contextLibrary.previousEmails) {
-    bullets.push("Use earlier written commitments as anchors.");
+
+  const activeGoal = pickActiveGoal(goals || [], "general");
+  if (activeGoal) {
+    return classifyGoalLabel(activeGoal.label);
   }
-  if (state.quickContext.counterpartRole) {
-    bullets.push(`Frame asks for a ${normalizeShortText(state.quickContext.counterpartRole, 26)} audience.`);
+
+  if (!isUnknownValue(offerTerms?.team || "")) {
+    return "team";
   }
-  return bullets.slice(0, 3);
+
+  return "general";
 }
 
-function buildMarketHeadline(state, contextLibrary) {
-  if (state.quickContext.industry) {
-    return `${normalizeShortText(state.quickContext.industry, 22)} market`;
+function detectTopicFromText(text) {
+  const lowered = String(text || "").toLowerCase();
+
+  if (/\b(signing|sign-on|bonus)\b/.test(lowered)) {
+    return "signingBonus";
   }
-  if (contextLibrary.previousDocs) {
-    return "Reference notes loaded";
+  if (/\b(equity|rsu|rsus|stock|shares|options)\b/.test(lowered)) {
+    return "equity";
   }
-  return "Quick market view";
+  if (/\b(location|remote|hybrid|onsite|on-site|office|relocation)\b/.test(lowered)) {
+    return "location";
+  }
+  if (/\b(team|org|organization|group|manager|reporting line)\b/.test(lowered)) {
+    return "team";
+  }
+  if (/\b(pto|vacation|time off|days off)\b/.test(lowered)) {
+    return "pto";
+  }
+  if (/\b(base|salary|compensation|comp|cash|band)\b/.test(lowered)) {
+    return "baseSalary";
+  }
+
+  return "general";
 }
 
-function buildMarketResearchBullets(state, contextLibrary, offerTerms) {
-  const bullets = [];
-  if (offerTerms.baseSalary && offerTerms.baseSalary !== "--") {
-    bullets.push(`Base currently at ${normalizeShortText(offerTerms.baseSalary, 24)}.`);
+function isTopicHoldingFirm(transcript, currentTopic) {
+  const recentText = transcript
+    .slice(-8)
+    .map((line) => String(line.text || "").toLowerCase())
+    .join(" ");
+
+  return /\b(policy|fixed|firm|capped|cap|final|best and final|no room|no flexibility|cannot|can't|unable|standard)\b/.test(
+    recentText
+  );
+}
+
+function getGoalCurrentValue(goal, offerTerms) {
+  const category = normalizeShortText(goal?.category || classifyGoalLabel(goal?.label || ""), 24);
+  const valueByCategory = {
+    baseSalary: offerTerms?.baseSalary,
+    signingBonus: offerTerms?.signingBonus,
+    equity: offerTerms?.equity,
+    location: offerTerms?.location,
+    pto: offerTerms?.pto,
+    team: offerTerms?.team
+  };
+
+  return normalizeShortText(valueByCategory[category] || "", 48);
+}
+
+function didGoalReachTarget(goal, currentValue) {
+  const target = normalizeShortText(goal?.target || "", 80);
+  if (!target || !currentValue || isUnknownValue(currentValue)) {
+    return false;
   }
-  if (offerTerms.equity && offerTerms.equity !== "--") {
-    bullets.push(`Equity currently at ${normalizeShortText(offerTerms.equity, 24)}.`);
+
+  const category = normalizeShortText(goal?.category || classifyGoalLabel(goal?.label || ""), 24);
+  if (category === "baseSalary" || category === "signingBonus" || category === "equity") {
+    const targetAmount = parseMoneyAmount(target);
+    const currentAmount = parseMoneyAmount(currentValue);
+    if (targetAmount !== null && currentAmount !== null) {
+      return currentAmount >= targetAmount;
+    }
   }
-  if (state.quickContext.additionalContext) {
-    bullets.push("Compare current offer against your outside options.");
-  } else if (contextLibrary.previousDocs || contextLibrary.previousEmails) {
-    bullets.push("Use imported docs as your nearest market anchor.");
-  } else {
-    bullets.push("Add competing offer or comp notes for sharper market guidance.");
+
+  if (category === "pto") {
+    const targetDays = parsePtoDays(target);
+    const currentDays = parsePtoDays(currentValue);
+    if (targetDays !== null && currentDays !== null) {
+      return currentDays >= targetDays;
+    }
   }
-  return bullets.slice(0, 3);
+
+  const normalizedTarget = normalizeComparableText(target);
+  const normalizedCurrent = normalizeComparableText(currentValue);
+  return Boolean(normalizedTarget && normalizedCurrent) &&
+    (normalizedCurrent.includes(normalizedTarget) || normalizedTarget.includes(normalizedCurrent));
+}
+
+function describeGap(goal, currentValue) {
+  const target = normalizeShortText(goal?.target || "", 80);
+  const category = normalizeShortText(goal?.category || classifyGoalLabel(goal?.label || ""), 24);
+
+  if (!target || !currentValue || isUnknownValue(currentValue)) {
+    return "";
+  }
+
+  if (category === "baseSalary" || category === "signingBonus" || category === "equity") {
+    const targetAmount = parseMoneyAmount(target);
+    const currentAmount = parseMoneyAmount(currentValue);
+    if (targetAmount !== null && currentAmount !== null && targetAmount > currentAmount) {
+      return `${formatCompactMoney(targetAmount - currentAmount)} gap`;
+    }
+  }
+
+  if (category === "pto") {
+    const targetDays = parsePtoDays(target);
+    const currentDays = parsePtoDays(currentValue);
+    if (targetDays !== null && currentDays !== null && targetDays > currentDays && Number.isFinite(targetDays)) {
+      return `${targetDays - currentDays} day gap`;
+    }
+  }
+
+  return `${currentValue} vs ${target}`;
+}
+
+function parseMoneyAmount(value) {
+  const match = String(value || "").match(/\$?\s*([\d,.]+)\s*([kKmM])?/);
+  if (!match) {
+    return null;
+  }
+
+  const numeric = Number.parseFloat(match[1].replace(/,/g, ""));
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  const suffix = (match[2] || "").toLowerCase();
+  if (suffix === "m") {
+    return numeric * 1000000;
+  }
+  if (suffix === "k") {
+    return numeric * 1000;
+  }
+  if (numeric < 1000) {
+    return numeric * 1000;
+  }
+  return numeric;
+}
+
+function parsePtoDays(value) {
+  const lower = String(value || "").toLowerCase();
+  if (!lower) {
+    return null;
+  }
+  if (lower.includes("unlimited")) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const match = lower.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks)/);
+  if (!match) {
+    return null;
+  }
+
+  const numeric = Number.parseFloat(match[1]);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  return /week/.test(match[2]) ? numeric * 5 : numeric;
+}
+
+function normalizeComparableText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\bnyc\b/g, "new york")
+    .replace(/\bny\b/g, "new york")
+    .replace(/\bon-site\b/g, "onsite")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function formatCompactMoney(amount) {
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return "";
+  }
+
+  if (amount >= 1000) {
+    const thousands = amount / 1000;
+    const rounded = Number.isInteger(thousands) ? String(thousands) : thousands.toFixed(1).replace(/\.0$/, "");
+    return `$${rounded}k`;
+  }
+
+  return `$${Math.round(amount)}`;
 }
 
 function buildWatchouts(latestLine) {
@@ -1183,6 +1619,398 @@ function buildWatchouts(latestLine) {
     warnings.push("Do not trade away multiple items at once.");
   }
   return warnings.slice(0, 2);
+}
+
+function reconcileGoalsWithTranscript(goals, transcript, offerTerms) {
+  const currentTopic = detectCurrentTopic(transcript, goals, offerTerms);
+  return goals.map((goal) => {
+    const coverage = assessGoalCoverage(goal, transcript, offerTerms, currentTopic);
+    if (goal.status === "done" || coverage.status === "done") {
+      return {
+        ...goal,
+        status: "done",
+        note: normalizeShortText(coverage.note || goal.note || "Covered in call", 80)
+      };
+    }
+    if (coverage.status === "active") {
+      return {
+        ...goal,
+        status: "active",
+        note: normalizeShortText(coverage.note || goal.note || "", 80)
+      };
+    }
+    if (coverage.status === "discussed") {
+      return {
+        ...goal,
+        status: "discussed",
+        note: normalizeShortText(coverage.note || goal.note || "", 80)
+      };
+    }
+    return {
+      ...goal,
+      status: "pending",
+      note: ""
+    };
+  });
+}
+
+function assessGoalCoverage(goal, transcript, offerTerms, currentTopic) {
+  const signal = getGoalSignal(goal.label);
+  const termCoverage = getOfferTermCoverage(goal, signal.category, offerTerms);
+  if (termCoverage.status === "done") {
+    return termCoverage;
+  }
+
+  const recentTranscript = transcript.slice(-80);
+  const liveTranscript = transcript.slice(-14);
+  const mentionedLine = recentTranscript.find((line) => matchesGoalLine(line.text, signal));
+  const liveMatch = liveTranscript.find((line) => matchesGoalLine(line.text, signal));
+  if (signal.category !== "custom" && currentTopic === signal.category && (liveMatch || termCoverage.status === "discussed")) {
+    return {
+      status: "active",
+      note: normalizeShortText(
+        termCoverage.note || `Live topic with ${normalizeShortText((liveMatch || mentionedLine)?.speaker || "them", 22)}`,
+        80
+      )
+    };
+  }
+  if (termCoverage.status === "discussed") {
+    return {
+      status: "discussed",
+      note: termCoverage.note
+    };
+  }
+  if (mentionedLine) {
+    return {
+      status: liveMatch ? "active" : "discussed",
+      note: `${liveMatch ? "Live with" : "Discussed with"} ${normalizeShortText(mentionedLine.speaker, 22)}`
+    };
+  }
+
+  return { status: "pending", note: "" };
+}
+
+function getGoalSignal(goalLabel) {
+  const lowered = normalizeShortText(goalLabel, 80).toLowerCase();
+  const keywords = lowered
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word.length > 2 && !GOAL_STOP_WORDS.has(word));
+
+  if (/(salary|base|compensation|cash|pay|band)/.test(lowered)) {
+    return {
+      category: "baseSalary",
+      patterns: [/\bsalary\b/, /\bbase\b/, /\bcompensation\b/, /\bcomp\b/, /\bcash\b/, /\bband\b/],
+      keywords
+    };
+  }
+
+  if (/(equity|rsu|stock|shares|options)/.test(lowered)) {
+    return {
+      category: "equity",
+      patterns: [/\bequity\b/, /\brsu\b/, /\brsus\b/, /\bstock\b/, /\bshares\b/, /\boptions\b/],
+      keywords
+    };
+  }
+
+  if (/(bonus|signing|sign-on)/.test(lowered)) {
+    return {
+      category: "signingBonus",
+      patterns: [/\bbonus\b/, /\bsigning\b/, /\bsign-on\b/, /\bsignon\b/],
+      keywords
+    };
+  }
+
+  if (/(location|remote|hybrid|onsite|on-site|relocation|office)/.test(lowered)) {
+    return {
+      category: "location",
+      patterns: [/\blocation\b/, /\bremote\b/, /\bhybrid\b/, /\bonsite\b/, /\bon-site\b/, /\boffice\b/, /\brelocation\b/],
+      keywords
+    };
+  }
+
+  if (/(pto|vacation|time off|days off)/.test(lowered)) {
+    return {
+      category: "pto",
+      patterns: [/\bpto\b/, /\bvacation\b/, /\btime off\b/, /\bdays off\b/],
+      keywords
+    };
+  }
+
+  if (/(team|org|organization|group|manager|reporting line)/.test(lowered)) {
+    return {
+      category: "team",
+      patterns: [/\bteam\b/, /\borg\b/, /\borganization\b/, /\bgroup\b/, /\bmanager\b/, /\breporting line\b/],
+      keywords
+    };
+  }
+
+  return {
+    category: "custom",
+    patterns: [],
+    keywords
+  };
+}
+
+function classifyGoalLabel(goalLabel) {
+  return getGoalSignal(goalLabel).category;
+}
+
+function matchesGoalLine(text, signal) {
+  const lowered = String(text || "").toLowerCase();
+
+  if (signal.patterns.some((pattern) => pattern.test(lowered))) {
+    return true;
+  }
+
+  if (!signal.keywords.length) {
+    return false;
+  }
+
+  const matchedKeywordCount = signal.keywords.filter((keyword) => lowered.includes(keyword)).length;
+  const threshold = signal.keywords.length <= 2 ? signal.keywords.length : 2;
+  return matchedKeywordCount >= threshold;
+}
+
+function getOfferTermCoverage(goal, goalCategory, offerTerms) {
+  const valueByCategory = {
+    baseSalary: offerTerms.baseSalary,
+    signingBonus: offerTerms.signingBonus,
+    equity: offerTerms.equity,
+    location: offerTerms.location,
+    pto: offerTerms.pto,
+    team: offerTerms.team
+  };
+
+  const value = normalizeShortText(valueByCategory[goalCategory] || "", 40);
+  if (value && !isUnknownValue(value)) {
+    return {
+      status: didGoalReachTarget(goal, value) ? "done" : "discussed",
+      note: `${didGoalReachTarget(goal, value) ? "On table" : "Current"}: ${value}`
+    };
+  }
+
+  return {
+    status: "pending",
+    note: ""
+  };
+}
+
+function buildStrategyContext(state) {
+  if (!state.quickContext.additionalContext) {
+    return "";
+  }
+  return normalizeShortText(state.quickContext.additionalContext, 110);
+}
+
+function buildStrategyQuestions(state, activeGoal, suggestedQuestions) {
+  const normalizedSuggested = normalizeStringArray(suggestedQuestions, 2, 96).map(ensureQuestionText);
+  const fallbackQuestions = buildHeuristicPhrasing(state, activeGoal, classifyGoalLabel(activeGoal?.label || "")).map(ensureQuestionText);
+  const merged = dedupeTextArray([...normalizedSuggested, ...fallbackQuestions]);
+  return merged.slice(0, 2);
+}
+
+function ensureQuestionText(text) {
+  const normalized = normalizeShortText(text, 96).replace(/[.!]+$/, "");
+  if (!normalized) {
+    return "";
+  }
+  return normalized.endsWith("?") ? normalized : `${normalized}?`;
+}
+
+function dedupeTextArray(items) {
+  const seen = new Set();
+  const output = [];
+
+  for (const item of items) {
+    const normalized = normalizeShortText(item, 110);
+    if (!normalized) {
+      continue;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(normalized);
+  }
+
+  return output;
+}
+
+function isRecruiterAudience(state) {
+  return /recruiter/i.test(state.quickContext.counterpartRole || "");
+}
+
+function buildStableMarketResearch(state, contextLibrary, offerTerms, rawMarketResearch, previousMarketResearch) {
+  const anchors = extractContextAnchors(state, contextLibrary);
+  const topic = state.currentTopic || detectCurrentTopic(state.transcript, state.goals, offerTerms);
+  const topicKey = normalizeShortText(topic || "general", 24) || "general";
+  const cached = state.marketCache?.[topicKey] || {};
+  const modelHeadline = normalizeShortText(rawMarketResearch?.headline || "", 52);
+  const modelBullets = normalizeStringArray(rawMarketResearch?.bullets, 2, 100);
+
+  let headline = cached.headline || modelHeadline || buildStableMarketHeadline(state, anchors, topic, offerTerms);
+  let expectation = cached.expectation || modelBullets[0] || buildTopicExpectationBullet(topic, state, anchors);
+
+  if (!cached.headline && !cached.expectation && (modelHeadline || modelBullets[0])) {
+    state.marketCache = {
+      ...(state.marketCache || {}),
+      [topicKey]: {
+        headline,
+        expectation
+      }
+    };
+  }
+
+  if (!headline) {
+    headline = normalizeShortText(previousMarketResearch?.headline || "", 52) || "Market anchor";
+  }
+
+  return {
+    headline,
+    bullets: dedupeTextArray([
+      expectation,
+      modelBullets[1] || buildOfferGapMarketBullet(topic, state, offerTerms, anchors)
+    ]).slice(0, 2)
+  };
+}
+
+function extractContextAnchors(state, contextLibrary) {
+  const sources = [
+    state.quickContext.additionalContext,
+    contextLibrary.previousEmails,
+    contextLibrary.previousDocs
+  ].filter(Boolean);
+
+  const anchors = {
+    salary: "",
+    equity: ""
+  };
+
+  for (const source of sources) {
+    if (!anchors.salary) {
+      const salaryMatch = source.match(/\$[\d,.]+\s?[kK]?/);
+      if (salaryMatch) {
+        anchors.salary = normalizeShortText(salaryMatch[0].replace(/\s+/g, ""), 24);
+      }
+    }
+
+    if (!anchors.equity && /(rsu|equity|stock|shares)/i.test(source)) {
+      const equityMatch = source.match(/\$[\d,.]+\s?[kK]?|\d[\d,.]*\s?(rsus|shares)/i);
+      if (equityMatch) {
+        anchors.equity = normalizeShortText(equityMatch[0], 24);
+      }
+    }
+  }
+
+  return anchors;
+}
+
+function buildStableMarketHeadline(state, anchors, topic, offerTerms) {
+  if (topic === "baseSalary" && anchors.salary) {
+    return `${anchors.salary} base anchor`;
+  }
+  if (topic === "equity" && anchors.equity) {
+    return `${anchors.equity} equity anchor`;
+  }
+  if (topic === "signingBonus") {
+    return normalizeShortText(state.quickContext.goalTargets?.signingBonus || offerTerms.signingBonus || "Sign-on range", 52);
+  }
+  if (topic === "location") {
+    return normalizeShortText(state.quickContext.goalTargets?.location || offerTerms.location || "Location policy", 52);
+  }
+  if (topic === "pto") {
+    return normalizeShortText(state.quickContext.goalTargets?.pto || offerTerms.pto || "PTO policy", 52);
+  }
+  if (topic === "team") {
+    return normalizeShortText(state.quickContext.goalTargets?.team || offerTerms.team || "Team placement", 52);
+  }
+  if (anchors.salary) {
+    return `${anchors.salary} comp anchor`;
+  }
+  if (state.quickContext.roleTitle) {
+    return `${normalizeShortText(state.quickContext.roleTitle, 22)} market`;
+  }
+  if (state.quickContext.industry) {
+    return `${normalizeShortText(state.quickContext.industry, 22)} market`;
+  }
+  return "Market anchor";
+}
+
+function buildTopicExpectationBullet(topic, state, anchors) {
+  if (topic === "baseSalary") {
+    return anchors.salary
+      ? `Expected base should center around ${anchors.salary} for this conversation context.`
+      : `Expected base should match ${normalizeShortText(state.quickContext.roleTitle || "this level", 28)} in ${normalizeShortText(state.quickContext.industry || "this industry", 28)}.`;
+  }
+  if (topic === "signingBonus") {
+    return "Expected sign-on usually depends on band limits and close risk, not title alone.";
+  }
+  if (topic === "equity") {
+    return anchors.equity
+      ? `Expected equity should be measured against ${anchors.equity} style grants.`
+      : "Expected equity should line up with level, refresh cadence, and growth profile.";
+  }
+  if (topic === "location") {
+    return "Location expectations should reflect office cadence, exception policy, and relocation rules.";
+  }
+  if (topic === "pto") {
+    return "PTO expectations should reflect level policy and any executive exception path.";
+  }
+  if (topic === "team") {
+    return "Team expectations should match scope, org maturity, and manager fit.";
+  }
+  return "Expected package should match level, scope, and market context.";
+}
+
+function buildOfferGapMarketBullet(topic, state, offerTerms, anchors) {
+  const activeGoal = pickActiveGoal(state.goals, topic);
+  const currentValue = getGoalCurrentValue(activeGoal, offerTerms);
+  const target = normalizeShortText(activeGoal?.target || "", 48);
+
+  if (activeGoal && currentValue && !isUnknownValue(currentValue) && target && !didGoalReachTarget(activeGoal, currentValue)) {
+    return `Current discussion is at ${currentValue}; your target is ${target}.`;
+  }
+
+  const topicOrder = {
+    baseSalary: [
+      ["baseSalary", anchors.salary ? `Base on table: ${offerTerms.baseSalary} against ${anchors.salary} anchor.` : `Current base discussed: ${offerTerms.baseSalary}.`],
+      ["signingBonus", `Current sign-on discussed: ${offerTerms.signingBonus}.`],
+      ["equity", `Current equity discussed: ${offerTerms.equity}.`]
+    ],
+    signingBonus: [
+      ["signingBonus", `Current sign-on discussed: ${offerTerms.signingBonus}.`],
+      ["baseSalary", anchors.salary ? `Base on table: ${offerTerms.baseSalary} against ${anchors.salary} anchor.` : `Current base discussed: ${offerTerms.baseSalary}.`]
+    ],
+    equity: [
+      ["equity", `Current equity discussed: ${offerTerms.equity}.`],
+      ["baseSalary", anchors.salary ? `Base on table: ${offerTerms.baseSalary} against ${anchors.salary} anchor.` : `Current base discussed: ${offerTerms.baseSalary}.`]
+    ],
+    location: [
+      ["location", `Location discussed: ${offerTerms.location}.`],
+      ["team", `Team discussed: ${offerTerms.team}.`]
+    ],
+    team: [
+      ["team", `Team discussed: ${offerTerms.team}.`],
+      ["location", `Location discussed: ${offerTerms.location}.`]
+    ],
+    pto: [["pto", `Current PTO discussed: ${offerTerms.pto}.`]]
+  };
+
+  const orderedCandidates = topicOrder[topic] || [
+    ["baseSalary", anchors.salary ? `Base on table: ${offerTerms.baseSalary} against ${anchors.salary} anchor.` : `Current base discussed: ${offerTerms.baseSalary}.`],
+    ["equity", `Current equity discussed: ${offerTerms.equity}.`],
+    ["location", `Location discussed: ${offerTerms.location}.`],
+    ["team", `Team discussed: ${offerTerms.team}.`]
+  ];
+
+  for (const [key, message] of orderedCandidates) {
+    if (!isUnknownValue(offerTerms[key])) {
+      return message;
+    }
+  }
+
+  return "Market expectation is stable; use the latest conversation only to size the remaining gap.";
 }
 
 function extractOfferTermsFromTranscript(transcript, currentTerms) {
@@ -1206,10 +2034,17 @@ function extractOfferTermsFromTranscript(transcript, currentTerms) {
         next.equity = normalizeShortText(equityMatch[0], 24);
       }
     }
-    if (/(remote|hybrid|onsite|on-site)/i.test(lower)) {
-      const remoteValue = ["remote", "hybrid", "onsite", "on-site"].find((item) => lower.includes(item));
-      if (remoteValue) {
-        next.remote = remoteValue === "on-site" ? "On-site" : remoteValue[0].toUpperCase() + remoteValue.slice(1);
+    if (/(location|remote|hybrid|onsite|on-site|office|relocation)/i.test(lower)) {
+      const locationValue = ["remote", "hybrid", "onsite", "on-site"].find((item) => lower.includes(item));
+      if (locationValue) {
+        next.location = locationValue === "on-site" ? "On-site" : locationValue[0].toUpperCase() + locationValue.slice(1);
+      } else {
+        const locationPhrase =
+          text.match(/\b(?:in|at)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b/) ||
+          text.match(/\b(?:new york|nyc|san francisco|bay area|seattle|austin|boston|chicago|los angeles)\b/i);
+        if (locationPhrase) {
+          next.location = normalizeShortText(locationPhrase[1] || locationPhrase[0], 24);
+        }
       }
     }
     if (/(pto|vacation|days off)/i.test(lower)) {
@@ -1218,12 +2053,13 @@ function extractOfferTermsFromTranscript(transcript, currentTerms) {
         next.pto = normalizeShortText(ptoMatch[0], 18);
       }
     }
-    if (/(start date|start|begin)/i.test(lower)) {
-      const dateMatch = text.match(/\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b/i);
-      if (dateMatch) {
-        next.startDate = normalizeShortText(dateMatch[0], 24);
-      } else if (/flexible/i.test(text)) {
-        next.startDate = "Flexible";
+    if (/(team|org|organization|group|manager|reporting line)/i.test(lower)) {
+      const teamMatch =
+        text.match(/(?:join|joining|on|with|within|for)\s+(?:the\s+)?([A-Za-z][A-Za-z/& -]{2,40})\s+team/i) ||
+        text.match(/team\s+(?:is|would be|will be)\s+([A-Za-z][A-Za-z/& -]{2,40})/i) ||
+        text.match(/(?:manager|reporting line)\s+(?:would be|is)\s+([A-Za-z][A-Za-z/& -]{2,40})/i);
+      if (teamMatch) {
+        next.team = normalizeShortText(teamMatch[1], 28);
       }
     }
   }
