@@ -1,5 +1,42 @@
 const tabStateCache = new Map();
 
+// ─── DEMO MODE ────────────────────────────────────────────────────────────────
+// Set DEMO_MODE = true before a demo to pre-load the Google negotiation scenario.
+// The preset overrides whatever the user types in the setup UI.
+// Flip back to false for normal use.
+const DEMO_MODE = true;
+
+const DEMO_PRESET = {
+  industry: "Software Engineering",
+  roleTitle: "Software Engineer (New Grad, L3)",
+  company: "Google",
+  counterpartRole: "HR Manager",
+  counterpartNotes: "Sarah — HR Manager. Firm on base band. Most flexibility in equity and sign-on.",
+  goalTargets: {
+    baseSalary: "$170k (min acceptable $163k)",
+    equity: "$50k/year RSUs",
+    signingBonus: "$28k",
+    location: "New York City (prefer transfer from Mountain View)"
+  },
+  priorities: [
+    "Base salary — push to $170k, floor $163k",
+    "Stock — push to $50k/year RSUs",
+    "Sign-on — push to $28k",
+    "Location — prefer NYC over Mountain View"
+  ],
+  additionalContext: [
+    "Current Google offer: $158k base, $32.2k stock/year, $18k sign-on, Mountain View CA.",
+    "Competing offer #1 — OpenAI: $160k base, $100k stock/year, $0 sign-on, San Francisco. Stock is private/illiquid but 3x Google equity.",
+    "Competing offer #2 — Meta: $139k base, $25k stock/year, $35k sign-on, Menlo Park CA.",
+    "Strategy: Use OpenAI equity gap as primary leverage. Recruiter will likely dismiss OpenAI stock as illiquid — counter that even at 50% risk discount it outpaces Google.",
+    "Base band is likely firm; pivot to equity if base stalls. Sign-on is most flexible lever.",
+    "NYC is preferred but likely unavailable — do not trade comp concessions for location promise.",
+    "Do not accept first 'no' on base without one Levels.fyi counter.",
+    "Levels.fyi median L3 Mountain View base: ~$167k. Top-of-band offers: $172k."
+  ].join(" ")
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 const TRANSCRIPT_STORAGE_PREFIX = "negotiation_tab_state_";
 const MEETING_CONTEXT_STORAGE_PREFIX = "negotiation_meeting_context_";
 const UPDATE_MIN_INTERVAL_MS = 4500;
@@ -174,7 +211,7 @@ async function handleStartSession(sender, message) {
 
   const settings = await getSettings();
   const state = await getOrCreateTabState(tabId, message.meetingId || "unknown");
-  const quickContext = normalizeQuickSetup(message.payload);
+  const quickContext = normalizeQuickSetup(DEMO_MODE ? DEMO_PRESET : message.payload);
 
   state.quickContext = quickContext;
   state.goals = makeGoalsFromQuickSetup(quickContext);
@@ -514,8 +551,25 @@ function buildPrompt(state, libraryContext, strategyTopicOverride = "") {
     recent_transcript: transcriptText
   };
 
+  const demoNote = DEMO_MODE
+    ? [
+        "DEMO SCENARIO NOTES (use this to ground suggestions):",
+        "- Google L3 new grad offer: $158k base / $32.2k stock / $18k sign-on / Mountain View CA",
+        "- OpenAI competing offer: $160k base / $100k stock / $0 sign-on / SF — stock is private but 3x Google equity",
+        "- Meta competing offer: $139k base / $25k stock / $35k sign-on / Menlo Park",
+        "- Recruiter (Sarah, HR Manager) will claim base band is firm at $158k",
+        "- Equity and sign-on are the most flexible levers",
+        "- NYC transfer not available for this offer",
+        "- Levels.fyi median L3 Mountain View base ~$167k — use as counter to 'top of band' claim",
+        "- Do not concede base without one Levels.fyi push first",
+        "- If equity moves to $40k, counter to $50k before accepting",
+        ""
+      ].join("\n")
+    : "";
+
   return [
     "Update the live negotiation panel.",
+    ...(demoNote ? [demoNote] : []),
     "",
     "Return JSON with exactly this shape:",
     "{",
