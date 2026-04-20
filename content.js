@@ -35,13 +35,19 @@ const uiState = {
 const transcriptCache = new Set();
 let lastCaptureAt = 0;
 let bootstrapVersion = 0;
+let captionHarvestTimer = null;
+let harvestInFlight = false;
+let lastFullCaptionScanAt = 0;
+
+const CAPTION_HARVEST_DEBOUNCE_MS = 250;
+const FULL_CAPTION_SCAN_INTERVAL_MS = 2500;
 
 const dom = createInterface();
 bindStaticEvents();
 void bootstrap();
 
 const observer = new MutationObserver(() => {
-  harvestCaptions();
+  scheduleCaptionHarvest(false);
 });
 
 if (document.body) {
@@ -49,7 +55,7 @@ if (document.body) {
 }
 
 setInterval(syncMeetingStage, 1200);
-setInterval(harvestCaptions, 1800);
+setInterval(() => scheduleCaptionHarvest(true), 1800);
 setInterval(updateCaptionHealth, 5000);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -1204,25 +1210,43 @@ function applySnapshot(snapshot) {
     return;
   }
 
+  const previousSessionActive = Boolean(uiState.snapshot?.sessionActive);
   uiState.snapshot = snapshot;
+
   dom.liveToggle.checked = Boolean(snapshot.coachEnabled);
   dom.toggleShell.classList.toggle("nai-on", Boolean(snapshot.coachEnabled));
   dom.toggleLabel.textContent = snapshot.coachEnabled ? "ON" : "OFF";
 
-  if (!snapshot.sessionActive || snapshot.statusText === "Transcript cleared." || snapshot.statusText === "New meeting detected. Add fresh context.") {
+  if (
+    !snapshot.sessionActive ||
+    snapshot.statusText === "Transcript cleared." ||
+    snapshot.statusText === "New meeting detected. Add fresh context."
+  ) {
     transcriptCache.clear();
     uiState.recentCaptions = [];
     lastCaptureAt = 0;
     renderCaptions();
   }
 
-  if (!uiState.setupOpen) {
+  const shouldSyncSetupForm =
+    uiState.setupOpen ||
+    !snapshot.sessionActive ||
+    previousSessionActive !== Boolean(snapshot.sessionActive);
+
+  if (shouldSyncSetupForm) {
     fillSetupForm(
-      snapshot.sessionActive ? snapshot.quickContext || defaultQuickSetup() : uiState.setupDraft || snapshot.quickContext || defaultQuickSetup()
+      snapshot.sessionActive
+        ? snapshot.quickContext || defaultQuickSetup()
+        : uiState.setupDraft || snapshot.quickContext || defaultQuickSetup()
     );
   }
 
-  if (uiState.joined && !snapshot.sessionActive && !uiState.setupDismissed && snapshot.statusText !== MEETING_CONTEXT_LOADING_TEXT) {
+  if (
+    uiState.joined &&
+    !snapshot.sessionActive &&
+    !uiState.setupDismissed &&
+    snapshot.statusText !== MEETING_CONTEXT_LOADING_TEXT
+  ) {
     openSetupModal(false);
   }
 
@@ -1530,43 +1554,91 @@ async function saveSetupDraft(meetingId, draft) {
 async function clearSetupDraft(meetingId) {
   await chrome.storage.local.remove(getSetupDraftStorageKey(meetingId));
 }
-
-function harvestCaptions() {
+function scheduleCaptionHarvest(forceFullScan = false) {
   if (!uiState.joined || !uiState.snapshot.sessionActive) {
     return;
   }
 
-  const found = collectCaptionRows();
-
-  const newLines = [];
-  for (const [key, item] of found.entries()) {
-    if (transcriptCache.has(key)) {
-      continue;
-    }
-
-    transcriptCache.add(key);
-    const line = {
-      speaker: item.speaker,
-      text: item.text,
-      at: new Date().toISOString()
-    };
-    newLines.push(line);
-    uiState.recentCaptions.push(line);
-  }
-
-  if (!newLines.length) {
+  if (captionHarvestTimer) {
     return;
   }
 
-  uiState.recentCaptions = uiState.recentCaptions.slice(-8);
-  renderCaptions();
-  lastCaptureAt = Date.now();
+  captionHarvestTimer = window.setTimeout(() => {
+    captionHarvestTimer = null;
+    harvestCaptions(forceFullScan);
+  }, CAPTION_HARVEST_DEBOUNCE_MS);
+}
 
-  void chrome.runtime.sendMessage({
-    type: "TRANSCRIPT_CHUNK",
-    meetingId: currentMeetingId,
-    lines: newLines
-  });
+function shouldRunFullCaptionScan(forceFullScan = false) {
+  if (forceFullScan) {
+    return true;
+  }
+
+  const now = Date.now();
+  if (now - lastFullCaptionScanAt >= FULL_CAPTION_SCAN_INTERVAL_MS) {
+    lastFullCaptionScanAt = now;
+    return true;
+  }
+
+  return false;
+}
+
+function harvestCaptions(forceFullScan = false) {
+  if (!uiState.joined || !uiState.snapshot.sessionActive || harvestInFlight) {
+    return;
+  }
+
+  harvestInFlight = true;
+
+  try {
+    const found = collectCaptionRows({ fullScan: shouldRunFullCaptionScan(forceFullScan) });
+
+    const newLines = [];
+    for (const [key, item] of found.entries()) {
+      const normalizedSpeaker = normalizeText(item.speaker || "Unknown", 80);
+      const normalizedText = normalizeText(item.text || "", 500);
+      const rollingBucket = Math.floor(Date.now() / 4000);
+      const cacheKey = `${normalizedSpeaker}|${normalizedText}|${rollingBucket}`;
+
+      if (transcriptCache.has(cacheKey)) {
+        continue;
+      }
+
+      transcriptCache.add(cacheKey);
+
+      const line = {
+        speaker: normalizedSpeaker,
+        text: normalizedText,
+        at: new Date().toISOString()
+      };
+
+      newLines.push(line);
+      uiState.recentCaptions.push(line);
+    }
+
+    if (!newLines.length) {
+      return;
+    }
+
+    uiState.recentCaptions = uiState.recentCaptions.slice(-8);
+    if (transcriptCache.size > 1500) {
+      const trimmed = Array.from(transcriptCache).slice(-800);
+      transcriptCache.clear();
+      for (const key of trimmed) {
+        transcriptCache.add(key);
+      }
+    }
+    renderCaptions();
+    lastCaptureAt = Date.now();
+
+    void chrome.runtime.sendMessage({
+      type: "TRANSCRIPT_CHUNK",
+      meetingId: currentMeetingId,
+      lines: newLines
+    });
+  } finally {
+    harvestInFlight = false;
+  }
 }
 
 function handleMeetingLinkChange(nextMeetingId) {
@@ -1602,13 +1674,17 @@ function updateCaptionHealth() {
   }
 }
 
-function collectCaptionRows() {
+function collectCaptionRows(options = {}) {
   const found = new Map();
+  const fullScan = Boolean(options.fullScan);
 
   addRowsFromMeetBlocks(found);
   addRowsFromDataAttributes(found);
-  addRowsFromAccessibilityRegions(found);
-  addRowsFromCaptionLikeSelectors(found);
+
+  if (fullScan) {
+    addRowsFromAccessibilityRegions(found);
+    addRowsFromCaptionLikeSelectors(found);
+  }
 
   return found;
 }
@@ -1801,7 +1877,7 @@ function normalizeCaptionText(value) {
   return String(value || "")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 220);
+    .slice(0, 800);
 }
 
 function isLikelyCaptionText(text) {

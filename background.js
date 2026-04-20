@@ -176,6 +176,7 @@ async function handleStartSession(sender, message) {
   const state = await getOrCreateTabState(tabId, message.meetingId || "unknown");
   const quickContext = normalizeQuickSetup(message.payload);
 
+  state.pendingRefresh = false;
   state.quickContext = quickContext;
   state.goals = makeGoalsFromQuickSetup(quickContext);
   state.panelData = makeInitialPanelData(state.goals);
@@ -237,7 +238,8 @@ async function handleTranscriptChunk(sender, message) {
       continue;
     }
 
-    const dedupeKey = `${speaker}|${text}`;
+    const rollingBucket = Math.floor(Date.now() / 5000);
+    const dedupeKey = `${speaker}|${text}|${rollingBucket}`;
     if (state.seen.has(dedupeKey)) {
       continue;
     }
@@ -253,7 +255,12 @@ async function handleTranscriptChunk(sender, message) {
 
   if (state.transcript.length > MAX_TRANSCRIPT_LINES) {
     state.transcript = state.transcript.slice(-MAX_TRANSCRIPT_LINES);
-    state.seen = new Set(state.transcript.map((line) => `${line.speaker}|${line.text}`));
+    state.seen = new Set(
+      state.transcript.slice(-250).map((line) => {
+        const bucket = Math.floor(new Date(line.at).getTime() / 5000);
+        return `${line.speaker}|${line.text}|${bucket}`;
+      })
+    );
   }
 
   state.lastCaptionAt = Date.now();
@@ -263,6 +270,12 @@ async function handleTranscriptChunk(sender, message) {
   const detectedTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
   state.currentTopic = detectedTopic;
   const refreshPlan = buildPanelRefreshPlan(state);
+  console.log("[NegotiateAI] transcript update", {
+    detectedTopic,
+    offerTerms: state.offerTerms,
+    refreshPlan,
+    totalCaptured: state.transcript.length
+  });
   state.panelData = {
     ...(state.panelData || makeInitialPanelData(state.goals)),
     goals: state.goals.map((goal) => ({ ...goal })),
@@ -274,7 +287,18 @@ async function handleTranscriptChunk(sender, message) {
   sendStateToTab(tabId, state);
 
   const now = Date.now();
-  if (state.coachEnabled && !state.generating && refreshPlan.shouldRefresh && (refreshPlan.topicChanged || now - state.lastAdviceAt >= UPDATE_MIN_INTERVAL_MS)) {
+
+  if (!state.coachEnabled || !refreshPlan.shouldRefresh) {
+    return;
+  }
+
+  if (state.generating) {
+    state.pendingRefresh = true;
+    await persistTabState(tabId);
+    return;
+  }
+
+  if (refreshPlan.topicChanged || now - state.lastAdviceAt >= UPDATE_MIN_INTERVAL_MS) {
     await generateAdviceForTab(tabId, refreshPlan);
   }
 }
@@ -303,6 +327,8 @@ async function handleResetSession(tabId) {
   }
 
   const state = await getOrCreateTabState(tabId, "unknown");
+
+  state.pendingRefresh = false;
   state.transcript = [];
   state.seen = new Set();
   state.offerTerms = defaultOfferTerms();
@@ -325,7 +351,11 @@ async function handleResetSession(tabId) {
 
 async function generateAdviceForTab(tabId, precomputedPlan = null) {
   const state = await getOrCreateTabState(tabId, "unknown");
-  if (!state.sessionActive || !state.coachEnabled || !state.transcript.length || state.generating) {
+  if (!state.sessionActive || !state.coachEnabled || !state.transcript.length) {
+    return;
+  }
+  if (state.generating) {
+    state.pendingRefresh = true;
     return;
   }
   if (!state.lastCaptionAt || Date.now() - state.lastCaptionAt > CAPTION_STALE_MS) {
@@ -333,6 +363,11 @@ async function generateAdviceForTab(tabId, precomputedPlan = null) {
   }
   const refreshPlan = precomputedPlan || buildPanelRefreshPlan(state);
   if (!refreshPlan.shouldRefresh) {
+    console.log("[NegotiateAI] skipped refresh", {
+      refreshPlan,
+      offerTerms: state.offerTerms,
+      totalCaptured: state.transcript.length
+    });
     return;
   }
 
@@ -345,6 +380,7 @@ async function generateAdviceForTab(tabId, precomputedPlan = null) {
     return;
   }
 
+  state.pendingRefresh = false;
   state.generating = true;
   state.statusText = "Updating suggestions...";
   sendStateToTab(tabId, state);
@@ -360,14 +396,10 @@ async function generateAdviceForTab(tabId, precomputedPlan = null) {
     state.offerTerms = { ...panelData.offerTerms };
     state.panelData = panelData;
     state.currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
-    if (refreshPlan.strategyShouldRefresh) {
-      state.strategyTopic = refreshPlan.strategyTopic;
-      state.lastStrategyTranscriptLength = state.transcript.length;
-    }
-    if (refreshPlan.marketShouldRefresh) {
-      state.marketTopic = refreshPlan.marketTopic;
-      state.lastMarketTranscriptLength = state.transcript.length;
-    }
+    state.strategyTopic = refreshPlan.strategyTopic;
+    state.marketTopic = refreshPlan.marketTopic;
+    state.lastStrategyTranscriptLength = state.transcript.length;
+    state.lastMarketTranscriptLength = state.transcript.length;
     state.lastAdviceAt = Date.now();
     state.statusText = `Updated ${new Date(state.lastAdviceAt).toLocaleTimeString([], {
       hour: "numeric",
@@ -386,19 +418,22 @@ async function generateAdviceForTab(tabId, precomputedPlan = null) {
     state.offerTerms = { ...fallbackPanel.offerTerms };
     state.panelData = fallbackPanel;
     state.currentTopic = detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
-    if (refreshPlan.strategyShouldRefresh) {
-      state.strategyTopic = refreshPlan.strategyTopic;
-      state.lastStrategyTranscriptLength = state.transcript.length;
-    }
-    if (refreshPlan.marketShouldRefresh) {
-      state.marketTopic = refreshPlan.marketTopic;
-      state.lastMarketTranscriptLength = state.transcript.length;
-    }
+    state.strategyTopic = refreshPlan.strategyTopic;
+    state.marketTopic = refreshPlan.marketTopic;
+    state.lastStrategyTranscriptLength = state.transcript.length;
+    state.lastMarketTranscriptLength = state.transcript.length;
     state.statusText = `Fallback mode: ${normalizeShortText(error.message, 100)}`;
     await persistTabState(tabId);
     sendStateToTab(tabId, state);
   } finally {
     state.generating = false;
+
+    if (state.pendingRefresh && state.sessionActive && state.coachEnabled) {
+      state.pendingRefresh = false;
+      setTimeout(() => {
+        void generateAdviceForTab(tabId);
+      }, 0);
+    }
   }
 }
 
@@ -562,12 +597,17 @@ function buildPrompt(state, libraryContext, strategyTopicOverride = "") {
 
 function normalizePanelData(raw, state, contextLibrary, refreshPlan = null) {
   const goalUpdates = Array.isArray(raw?.goals) ? raw.goals : [];
-  const mergedOfferTerms = mergeOfferTerms(state.offerTerms, {});
+  const mergedOfferTerms = mergeOfferTerms(
+    state.offerTerms,
+    raw?.offer_terms || raw?.offerTerms || {}
+  );
+
   const draftGoals = state.goals.map((goal, index) => {
     const update =
       goalUpdates.find((item) => String(item?.id || "") === goal.id) ||
       goalUpdates[index] ||
       {};
+
     return {
       id: goal.id,
       label: goal.label,
@@ -577,10 +617,15 @@ function normalizePanelData(raw, state, contextLibrary, refreshPlan = null) {
       note: normalizeShortText(update.note || "", 80)
     };
   });
+
   const nextGoals = reconcileGoalsWithTranscript(draftGoals, state.transcript, mergedOfferTerms);
-  const currentTopic = normalizeShortText(refreshPlan?.strategyTopic || state.currentTopic || "", 24) ||
+
+  const currentTopic =
+    normalizeShortText(refreshPlan?.strategyTopic || state.currentTopic || "", 24) ||
     detectCurrentTopic(state.transcript, nextGoals, mergedOfferTerms);
+
   const activeGoal = pickActiveGoal(nextGoals, currentTopic);
+
   const strategyState = {
     ...state,
     offerTerms: mergedOfferTerms,
@@ -593,6 +638,7 @@ function normalizePanelData(raw, state, contextLibrary, refreshPlan = null) {
       refreshPlan?.strategyShouldRefresh === false
         ? state.panelData?.strategy || makeInitialPanelData(nextGoals).strategy
         : buildStrategyPanel(strategyState, activeGoal, currentTopic),
+
     marketResearch:
       refreshPlan?.marketShouldRefresh === false
         ? state.panelData?.marketResearch || makeInitialPanelData(nextGoals).marketResearch
@@ -604,6 +650,7 @@ function normalizePanelData(raw, state, contextLibrary, refreshPlan = null) {
             state.panelData?.marketResearch,
             refreshPlan?.marketTopic || currentTopic
           ),
+
     goals: nextGoals,
     offerTerms: mergedOfferTerms,
     watchouts: normalizeStringArray(raw?.watchouts, 2, 90),
@@ -855,6 +902,7 @@ async function persistTabState(tabId) {
 
   await chrome.storage.local.set({
     [getTabStorageKey(tabId)]: {
+      pendingRefresh: state.pendingRefresh,
       meetingId: state.meetingId,
       transcript: state.transcript,
       sessionActive: state.sessionActive,
@@ -897,8 +945,14 @@ function hydrateTabState(raw, meetingId) {
   const state = {
     meetingId: normalizeMeetingId(meetingId || raw?.meetingId || "unknown"),
     transcript,
-    seen: new Set(transcript.map((line) => `${line.speaker}|${line.text}`)),
+    seen: new Set(
+      transcript.slice(-250).map((line) => {
+        const bucket = Math.floor(new Date(line.at).getTime() / 5000);
+        return `${line.speaker}|${line.text}|${bucket}`;
+      })
+    ),
     sessionActive: Boolean(raw?.sessionActive),
+    pendingRefresh: Boolean(raw?.pendingRefresh),
     coachEnabled: raw?.coachEnabled !== false,
     quickContext,
     goals,
@@ -913,6 +967,7 @@ function hydrateTabState(raw, meetingId) {
     lastAdviceAt: Number(raw?.lastAdviceAt || 0),
     lastCaptionAt: Number(raw?.lastCaptionAt || 0),
     generating: false,
+    pendingRefresh: false,
     statusText: normalizeShortText(raw?.statusText || "", 120)
   };
 
@@ -922,6 +977,7 @@ function hydrateTabState(raw, meetingId) {
 
 function resetStateForMeeting(state, meetingId, savedQuickContext = null) {
   state.meetingId = normalizeMeetingId(meetingId || "unknown");
+  state.pendingRefresh = false;
   state.transcript = [];
   state.seen = new Set();
   state.coachEnabled = true;
@@ -1162,10 +1218,21 @@ function trimForPrompt(value, maxLength) {
 }
 
 function isUnknownValue(value) {
-  const lowered = value.toLowerCase();
-  return lowered === "--" || lowered === "-" || lowered === "unknown" || lowered === "not mentioned" || lowered === "n/a";
+  const lowered = String(value || "").toLowerCase().trim();
+  return (
+    !lowered ||
+    lowered === "--" ||
+    lowered === "-" ||
+    lowered === "." ||
+    lowered === "," ||
+    lowered === "unknown" ||
+    lowered === "not mentioned" ||
+    lowered === "n/a" ||
+    lowered === "na" ||
+    lowered === "tbd" ||
+    lowered === "none"
+  );
 }
-
 function extractOpenAIText(payload) {
   if (typeof payload?.output_text === "string" && payload.output_text.trim()) {
     return payload.output_text.trim();
@@ -1471,22 +1538,33 @@ function pickActiveGoal(goals, currentTopic) {
 }
 
 function detectCurrentTopic(transcript, goals, offerTerms) {
-  const recentLines = transcript.slice(-16);
+  const recentLines = transcript.slice(-12);
 
-  for (let index = recentLines.length - 1; index >= 0; index -= 1) {
-    const detected = detectTopicFromText(recentLines[index].text);
-    if (detected !== "general") {
-      return detected;
+  const topics = recentLines.map((line) => detectTopicFromText(line.text)).filter((topic) => topic !== "general");
+  const recentTopic = topics.length ? topics[topics.length - 1] : "general";
+
+  if (recentTopic !== "general") {
+    return recentTopic;
+  }
+
+  const changedFields = [
+    ["team", offerTerms?.team],
+    ["pto", offerTerms?.pto],
+    ["location", offerTerms?.location],
+    ["signingBonus", offerTerms?.signingBonus],
+    ["equity", offerTerms?.equity],
+    ["baseSalary", offerTerms?.baseSalary]
+  ];
+
+  for (const [topic, value] of changedFields) {
+    if (!isUnknownValue(value || "")) {
+      return topic;
     }
   }
 
   const activeGoal = pickActiveGoal(goals || [], "general");
   if (activeGoal) {
     return classifyGoalLabel(activeGoal.label);
-  }
-
-  if (!isUnknownValue(offerTerms?.team || "")) {
-    return "team";
   }
 
   return "general";
@@ -1684,45 +1762,73 @@ function buildWatchouts(latestLine) {
 }
 
 function buildPanelRefreshPlan(state) {
-  const detectedTopic = normalizeShortText(state.currentTopic || "", 24) ||
-    detectCurrentTopic(state.transcript, state.goals, state.offerTerms);
-  const currentStrategyTopic = normalizeShortText(state.strategyTopic || "", 24) || detectedTopic || "general";
-  const currentMarketTopic = normalizeShortText(state.marketTopic || "", 24) || currentStrategyTopic;
-  const missingStrategy = !(state.panelData?.strategy?.bullets || []).length;
-  const missingMarket = !normalizeShortText(state.panelData?.marketResearch?.headline || "", 52) &&
-    !((state.panelData?.marketResearch?.bullets || []).length);
-  const topicChanged = shouldSwitchDisplayedTopic(state.transcript, currentStrategyTopic, detectedTopic);
-  const strategyTermChanged = didRelevantOfferTermChange(state.panelData?.offerTerms, state.offerTerms, currentStrategyTopic);
-  const marketTermChanged = didRelevantOfferTermChange(state.panelData?.offerTerms, state.offerTerms, currentMarketTopic);
-  const strategyProgressed = hasStrategyProgressSince(state, currentStrategyTopic);
-  const initialTopic = detectedTopic && detectedTopic !== "general" ? detectedTopic : currentStrategyTopic;
+  const previousStrategyTopic = normalizeShortText(state.strategyTopic || "", 24) || "general";
+  const previousMarketTopic = normalizeShortText(state.marketTopic || "", 24) || "general";
+  const detectedTopic =
+    normalizeShortText(detectCurrentTopic(state.transcript, state.goals, state.offerTerms), 24) || "general";
+
+  const termChanged = didAnyOfferTermChange(
+    state.panelData?.offerTerms || defaultOfferTerms(),
+    state.offerTerms
+  );
+
+  const strategyTopicChanged = detectedTopic !== previousStrategyTopic;
+  const marketTopicChanged = detectedTopic !== previousMarketTopic;
+
+  const newStrategyLines = state.transcript.length - (state.lastStrategyTranscriptLength || 0);
+  const newMarketLines = state.transcript.length - (state.lastMarketTranscriptLength || 0);
+
+  const strategyShouldRefresh =
+    termChanged ||
+    strategyTopicChanged ||
+    newStrategyLines >= 1 ||
+    hasTopicProgressSignal(state.transcript.slice(-8), detectedTopic);
+
+  const marketShouldRefresh =
+    termChanged ||
+    marketTopicChanged ||
+    newMarketLines >= 2;
 
   return {
-    shouldRefresh: missingStrategy || missingMarket || topicChanged || strategyTermChanged || marketTermChanged || strategyProgressed,
-    strategyShouldRefresh: missingStrategy || topicChanged || strategyTermChanged || strategyProgressed,
-    marketShouldRefresh: missingMarket || topicChanged || marketTermChanged,
-    topicChanged,
-    strategyTopic: topicChanged ? detectedTopic : (missingStrategy ? initialTopic : currentStrategyTopic),
-    marketTopic: topicChanged ? detectedTopic : (missingMarket ? initialTopic : currentMarketTopic)
+    shouldRefresh: strategyShouldRefresh || marketShouldRefresh,
+    topicChanged: strategyTopicChanged || marketTopicChanged,
+    strategyShouldRefresh,
+    marketShouldRefresh,
+    strategyTopic: detectedTopic,
+    marketTopic: detectedTopic
   };
 }
 
-function shouldSwitchDisplayedTopic(transcript, currentTopic, detectedTopic) {
-  if (!detectedTopic || detectedTopic === "general" || detectedTopic === currentTopic) {
-    return false;
+function didAnyOfferTermChange(previousTerms, nextTerms) {
+  const keys = ["baseSalary", "signingBonus", "equity", "location", "pto", "team"];
+
+  for (const key of keys) {
+    const prev = normalizeShortText(previousTerms?.[key] || "", 80);
+    const next = normalizeShortText(nextTerms?.[key] || "", 80);
+
+    if (prev !== next && !isUnknownValue(next)) {
+      return true;
+    }
   }
 
-  const recentTopics = transcript
-    .slice(-6)
-    .map((line) => detectTopicFromText(line.text))
-    .filter((topic) => topic !== "general");
-
-  if (!recentTopics.length) {
-    return false;
-  }
-
-  return recentTopics.filter((topic) => topic === detectedTopic).length >= 2 && recentTopics.slice(-3).includes(detectedTopic);
+  return false;
 }
+
+function didAnyOfferTermChange(previousTerms, nextTerms) {
+  const keys = ["baseSalary", "signingBonus", "equity", "location", "pto", "team"];
+
+  for (const key of keys) {
+    const prev = normalizeShortText(previousTerms?.[key] || "", 80);
+    const next = normalizeShortText(nextTerms?.[key] || "", 80);
+
+    if (prev !== next && !isUnknownValue(next)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 
 function hasStrategyProgressSince(state, topic) {
   const sinceIndex = Math.max(0, Number(state.lastStrategyTranscriptLength || 0));
@@ -2217,72 +2323,131 @@ function extractOfferTermCandidatesFromLine(text) {
   const confidence = getOfferLineConfidence(lower);
   const candidates = [];
 
-  collectAmountCandidates(
-    candidates,
-    "baseSalary",
-    original,
-    confidence,
-    [
-      /\b(?:base(?: salary)?|salary|cash comp(?:ensation)?)\s*(?:would be|will be|is|at|of|around|about|to|=)?\s*\$?\s*([\d,.]+)\s*([kKmM])?\b/i,
-      /\$?\s*([\d,.]+)\s*([kKmM])?\s*(?:base(?: salary)?|salary|cash comp(?:ensation)?)/i
-    ]
-  );
-  collectAmountCandidates(
-    candidates,
-    "signingBonus",
-    original,
-    confidence,
-    [
-      /\b(?:sign(?:ing)?(?: |-)?bonus|sign(?: |-)?on)\s*(?:would be|will be|is|at|of|around|about|to|=)?\s*\$?\s*([\d,.]+)\s*([kKmM])?\b/i,
-      /\$?\s*([\d,.]+)\s*([kKmM])?\s*(?:sign(?:ing)?(?: |-)?bonus|sign(?: |-)?on)/i
-    ]
-  );
+  collectAmountCandidates(candidates, "baseSalary", original, confidence, [
+    /\b(?:base(?:\s+salary)?|salary|cash comp(?:ensation)?)\s*(?:is|would be|will be|at|of|around|about|to)?\s*\$?([\d,.]+)\s*([kKmM]?)/i,
+    /\b\$?([\d,.]+)\s*([kKmM]?)\s*(?:base(?:\s+salary)?|salary)\b/i
+  ]);
 
-  const equityMatch =
-    original.match(/\b(?:equity|rsus?|stock|shares?)\s*(?:would be|will be|is|at|of|around|about|to|=)?\s*(\$?\s*[\d,.]+\s*[kKmM]?|\d[\d,.]*\s*(?:rsus|shares))/i) ||
-    original.match(/(\$?\s*[\d,.]+\s*[kKmM]?|\d[\d,.]*\s*(?:rsus|shares))\s*(?:in\s+)?(?:equity|rsus?|stock|shares)/i);
-  if (equityMatch) {
-    candidates.push({
-      field: "equity",
-      value: normalizeEquityValue(equityMatch[1] || equityMatch[0], original),
-      score: confidence + 1
-    });
-  }
+  collectAmountCandidates(candidates, "signingBonus", original, confidence, [
+    /\b(?:sign(?:ing)?\s+bonus|bonus|sign-on)\s*(?:is|would be|will be|at|of|around|about|to)?\s*\$?([\d,.]+)\s*([kKmM]?)/i,
+    /\b\$?([\d,.]+)\s*([kKmM]?)\s*(?:sign(?:ing)?\s+bonus|bonus|sign-on)\b/i,
+    /\bcan do up to\s+\$?([\d,.]+)\s*([kKmM]?)\b(?=.*\bbonus\b)/i
+  ]);
 
-  if (/\b(pto|vacation|time off)\b/i.test(original)) {
-    const ptoMatch = original.match(/\b(unlimited(?:\s+pto)?|\d+\s*(?:days?|weeks?))\b/i);
-    if (ptoMatch) {
-      candidates.push({
-        field: "pto",
-        value: normalizePtoValue(ptoMatch[1]),
-        score: confidence + 1
-      });
+  collectAmountCandidates(candidates, "equity", original, confidence, [
+    /\b(?:equity|rsu|rsus|stock|grant)\s*(?:is|would be|will be|at|of|around|about|to)?\s*\$?([\d,.]+)\s*([kKmM]?)/i,
+    /\b\$?([\d,.]+)\s*([kKmM]?)\s+(?:in\s+)?(?:equity|rsu|rsus|stock)\b/i,
+    /\bgrant(?:\s+would be|\s+is|\s+at|\s+of)?\s+\$?([\d,.]+)\s*([kKmM]?)/i
+  ]);
+
+  if (/\b(equity|rsu|rsus|stock|grant|vesting|vest|refreshers?)\b/.test(lower)) {
+    const equityCandidate = extractEquityCandidate(original);
+    if (equityCandidate) {
+      candidates.push({ field: "equity", value: equityCandidate, score: confidence + 2 });
     }
   }
 
-  if (/\b(location|based|office|remote|hybrid|onsite|on-site|relocation|work from)\b/.test(lower)) {
+  if (/\b(location|remote|hybrid|on-site|onsite|office|based|relocation|new york|nyc|san francisco|sf|seattle|austin|boston)\b/.test(lower)) {
     const locationCandidate = extractLocationCandidate(original, lower);
     if (locationCandidate) {
-      candidates.push({
-        field: "location",
-        value: locationCandidate,
-        score: confidence + 1
-      });
+      candidates.push({ field: "location", value: locationCandidate, score: confidence + 2 });
     }
   }
 
-  if (/\b(team|org|organization|group|joining|join)\b/.test(lower)) {
+  if (/\b(pto|vacation|time off|days off|weeks off|unlimited)\b/.test(lower)) {
+    const ptoCandidate = extractPtoCandidate(original);
+    if (ptoCandidate) {
+      candidates.push({ field: "pto", value: ptoCandidate, score: confidence + 2 });
+    }
+  }
+
+  if (/\b(team|org|organization|group|joining|join|report into|work with|infra|platform|ml infra|core|foundation)\b/.test(lower)) {
     const teamCandidate = extractTeamCandidate(original);
     if (teamCandidate) {
-      candidates.push({
-        field: "team",
-        value: teamCandidate,
-        score: confidence + 1
-      });
+      candidates.push({ field: "team", value: teamCandidate, score: confidence + 2 });
     }
   }
 
   return candidates;
+}
+
+function extractEquityCandidate(text) {
+  const original = normalizeShortText(text || "", 80);
+  const lower = original.toLowerCase();
+
+  const moneyMatch = original.match(/\$?([\d,.]+)\s*([kKmM]?)(?:\s+(?:in\s+)?(?:equity|rsu|rsus|stock))?/i);
+  if (moneyMatch && /\b(equity|rsu|rsus|stock|grant)\b/.test(lower)) {
+    let value = formatMoneyValue(moneyMatch[1], moneyMatch[2]);
+    if (/\b(over\s+4\s+years|4\s+years?)\b/i.test(original)) {
+      value = `${value} over 4 years`;
+    }
+    return value;
+  }
+
+  if (/\brefreshers?\b/i.test(original)) {
+    return normalizeShortText(original, 60);
+  }
+
+  return "";
+}
+
+function extractLocationCandidate(text, lower = "") {
+  const original = normalizeShortText(text || "", 100);
+  const lowered = lower || original.toLowerCase();
+
+  const moveMatch =
+    original.match(/\b(?:move|change|switch)\s+(?:the\s+)?location\s+(?:to|into)\s+(san francisco|sf|bay area|new york|nyc|seattle|austin|boston|chicago|los angeles)\b/i) ||
+    original.match(/\b(?:location is|role is in|office is in|working from|work from|located in|based in|based out of)\s+(san francisco|sf|bay area|new york|nyc|seattle|austin|boston|chicago|los angeles)\b/i) ||
+    original.match(/\b(?:san francisco|sf|bay area|new york|nyc|seattle|austin|boston|chicago|los angeles)\b/i);
+
+  if (moveMatch) {
+    return normalizeOfferTermValue("location", moveMatch[1] || moveMatch[0]);
+  }
+  if (/\bremote\b/.test(lowered)) {
+    return "Remote";
+  }
+  if (/\bhybrid\b/.test(lowered)) {
+    return "Hybrid";
+  }
+  if (/\bon-?site\b/.test(lowered)) {
+    return "On-site";
+  }
+
+  return "";
+}
+
+function extractPtoCandidate(text) {
+  const original = normalizeShortText(text || "", 120);
+  const lower = original.toLowerCase();
+
+  if (/\bunlimited\b/.test(lower) && /\b(pto|vacation|time off)\b/.test(lower)) {
+    return "Unlimited PTO";
+  }
+
+  const daysMatch = original.match(/\b(\d{1,2})\s+(days?|weeks?)\b/i);
+  if (daysMatch) {
+    if (/\b(pto|vacation|time off)\b/.test(lower) || /\bfor this role\b/.test(lower)) {
+      return `${daysMatch[1]} ${daysMatch[2]}`;
+    }
+  }
+
+  return "";
+}
+
+function extractTeamCandidate(text) {
+  const original = normalizeShortText(text || "", 120);
+
+  const teamMatch =
+    original.match(/(?:join|joining|on|within)\s+(?:the\s+)?([A-Za-z][A-Za-z/& -]{2,50})\s+(?:team|org|group)\b/i) ||
+    original.match(/(?:team|org|group)\s+(?:would be|will be|is)\s+([A-Za-z][A-Za-z/& -]{2,50})\b/i) ||
+    original.match(/(?:this will be|this is|it will be)\s+(?:the\s+)?([A-Za-z][A-Za-z/& -]{2,50})\s+team\b/i) ||
+    original.match(/(?:the\s+)?([A-Za-z][A-Za-z/& -]{2,50})\s+team\b/i);
+
+  if (!teamMatch) {
+    return "";
+  }
+
+  return normalizeTeamValue(teamMatch[1]);
 }
 
 function collectAmountCandidates(candidates, field, text, confidence, patterns) {
